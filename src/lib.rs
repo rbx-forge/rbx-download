@@ -73,7 +73,7 @@ pub struct Cli {
     // `hide_env_values` is not cosmetic: without it clap prints
     // `[env: RBX_API_KEY=<the actual key>]` in `--help`, so a key leaks into any
     // pasted output, CI log or screenshot of the help page.
-    #[arg(long, env = "RBX_API_KEY", hide_env_values = true)]
+    #[arg(long, short = 'a', env = "RBX_API_KEY", hide_env_values = true)]
     pub api_key: Option<String>,
 
     /// Roblox session cookie (`.ROBLOSECURITY`), for the public backend.

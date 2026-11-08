@@ -38,7 +38,7 @@ rbx-download 123456789 --asset-version 3 --api-key "$RBX_API_KEY"
 - `--type <id|alias>`: skip the economy metadata lookup by giving the asset type yourself. Aliases: `image`, `audio`, `mesh`, `lua`, `place`, `model`, `animation`, `video`, `font`
 - `--asset-version <n>`: pin a specific asset version (Open Cloud only; requires an API key and exactly one id)
 - `--raw`: don't dereference Animation wrappers to their KeyframeSequence
-- `--api-key <key>`: Open Cloud API key, or `RBX_API_KEY`
+- `--api-key <key>`, `-a`: Open Cloud API key, or `RBX_API_KEY`
 - `--cookie <value>`: `.ROBLOSECURITY` cookie for the public backend, or `RBX_COOKIE`
 - `--auto-cookie` / `--no-auto-cookie`: use a signed-in Studio's session without asking, or never look for one
 
