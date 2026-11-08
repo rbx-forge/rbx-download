@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-08
+
 First release as a standalone tool.
 
 - Downloads assets by id through the public `assetdelivery` endpoint, or through Open Cloud whenever an API key is available.
