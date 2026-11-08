@@ -1,0 +1,61 @@
+[package]
+name = "rbx-download"
+version = "0.1.0"
+edition = "2021"
+# Set by a dependency, not by this crate's own sources: `image`, which arrives
+# through `rbx-core`, declares 1.88. It moves when a dependency moves it; the
+# `msrv` CI job is what stops it moving silently.
+rust-version = "1.88"
+license = "MPL-2.0"
+description = "Download Roblox assets by id from the command line"
+repository = "https://github.com/rbx-dev-tools/rbx-download"
+homepage = "https://github.com/rbx-dev-tools/rbx-download"
+authors = ["rbx-forge"]
+keywords = ["roblox", "assets", "download", "cli"]
+categories = ["command-line-utilities", "game-development"]
+readme = "README.md"
+# crates.io refuses a crate with a git dependency, and this one has one. The
+# binary ships through GitHub releases.
+publish = false
+
+[lib]
+name = "rbx_download"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rbx-download"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+colored = "2"
+# Same major as `rbx-core`, so the `reqwest::Client` it builds is the type this
+# crate sends requests with. TLS is whatever `rbx-core` selects, which is
+# rustls over the OS trust store: no OpenSSL to find at launch.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# The HTTP client, the host constants, the filename sanitiser and the Studio
+# cookie lookup with its consent prompt. A branch rather than a rev: Cargo.lock
+# pins the exact commit, and `cargo update -p rbx-core` is how a fix arrives.
+rbx-core = { git = "https://github.com/rbx-forge/rbx-cli", branch = "main" }
+
+[dev-dependencies]
+wiremock = "0.6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_code = "warn"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+todo = "warn"
+dbg_macro = "warn"
+print_stdout = "allow"   # CLI tool, println! is intentional
+print_stderr = "allow"

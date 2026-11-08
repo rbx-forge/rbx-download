@@ -1,0 +1,9 @@
+# Normalise line endings in the repository to LF, whatever the working tree
+# uses. Without this, a file saved with CRLF on Windows reads as a whole-file
+# rewrite in `git diff`. Git detects binary content on its own and leaves it
+# alone.
+* text=auto
+
+# Rust sources check out with LF on every platform, not just in the repository,
+# so a multi-line string literal means the same bytes everywhere.
+*.rs text eol=lf

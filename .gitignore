@@ -1,0 +1,11 @@
+/target
+
+# Editor/tool configs
+.idea/
+.vscode/
+.zed/
+.claude/
+
+# The default output directory. A manual test run drops real assets here, and
+# their names are whatever the asset was called.
+/downloads/
