@@ -7,14 +7,14 @@ Download Roblox assets by id from the command line: images, audio, meshes, model
 With [mise](https://mise.jdx.dev) or [Rokit](https://github.com/rojo-rbx/rokit), either of which pins the latest release in your project's config:
 
 ```bash
-mise use --pin github:rbx-dev-tools/rbx-download
-rokit add rbx-dev-tools/rbx-download   # or, with Rokit
+mise use --pin github:rbx-forge/rbx-download
+rokit add rbx-forge/rbx-download   # or, with Rokit
 ```
 
-Or take a binary for your platform from the [releases page](https://github.com/rbx-dev-tools/rbx-download/releases), which ships a `SHA256SUMS` alongside the archives, or build from source:
+Or take a binary for your platform from the [releases page](https://github.com/rbx-forge/rbx-download/releases), which ships a `SHA256SUMS` alongside the archives, or build from source:
 
 ```bash
-cargo install --git https://github.com/rbx-dev-tools/rbx-download --locked
+cargo install --git https://github.com/rbx-forge/rbx-download --locked
 ```
 
 ## Quick start
