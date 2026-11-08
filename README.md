@@ -26,9 +26,11 @@ rbx-download 123 456 789 -o assets
 # From a file (whitespace/comma separated, # comments allowed)
 rbx-download --file ids.txt
 
-# A specific version, through Open Cloud
-rbx-download 123456789 --asset-version 3 --api-key "$RBX_API_KEY"
+# A specific version, through Open Cloud (reads the key from RBX_API_KEY)
+rbx-download 123456789 --asset-version 3
 ```
+
+With several ids, each one is attempted and reported on its own line. One that fails does not stop the others; the run ends with a count, and exits non-zero if any failed.
 
 ## Options
 
@@ -51,7 +53,7 @@ rbx-download 123456789 --asset-version 3 --api-key "$RBX_API_KEY"
 | `--asset-version <n>` given | Open Cloud (requires an API key) |
 | `--public` given | Public, always |
 
-The public backend fetches most publicly available assets without auth. A cookie extends its reach to assets your account can access. The Open Cloud backend uses your API key's permissions and is the only one supporting `--asset-version`.
+The public backend fetches most publicly available assets without auth. A cookie extends its reach to assets your account can access. The Open Cloud backend uses your API key's permissions and is the only one supporting `--asset-version`. The key needs the `legacy-asset:manage` scope.
 
 ## The cookie
 
