@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Security
+
+- Release archives carry a build provenance attestation: `gh attestation verify <zip> --repo rbx-forge/rbx-download`. The build jobs run with read access only, and the publishing job alone may write.
+
 ## [0.1.0] - 2026-11-08
 
 First release as a standalone tool.
