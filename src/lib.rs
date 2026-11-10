@@ -22,7 +22,9 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use colored::Colorize;
 
-use rbx_core::api::{execute_with_retry_policy, ApiBase, ApiError, RetryPolicy};
+use rbx_core::api::{ApiBase, RetryPolicy};
+
+use http::Http;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -144,7 +146,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     // Auth per backend. The cookie goes through the one resolution chain, so
     // the consent prompt, the refusals and the stderr notice are the shared
     // ones rather than a second copy of them.
-    let client = http_client(CONNECT_TIMEOUT, READ_TIMEOUT)?;
+    let http = Http::new(CONNECT_TIMEOUT, READ_TIMEOUT, RetryPolicy::default())?;
     let cookie_header = match source {
         Source::Public => rbx_core::env::resolve_cookie(
             cli.cookie.as_deref(),
@@ -167,7 +169,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     sweep_stale_parts(&cli.output, STALE_PART_AGE);
 
     let ctx = Ctx {
-        client,
+        http,
         hosts: Hosts::default(),
         cookie_header,
         api_key,
@@ -177,7 +179,6 @@ pub async fn run(cli: Cli) -> Result<()> {
         raw: cli.raw,
         force: cli.force,
         forced,
-        retry: RetryPolicy::default(),
     };
 
     download_all(&ctx, &ids).await
@@ -281,111 +282,162 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// response or in the middle of its body.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The client every request goes through.
+/// Everything that goes out to the network, and everything read back.
 ///
-/// No total timeout: one would cap the whole transfer, body included, and cut
-/// a large place on a slow link off while its bytes are still arriving. A
-/// connect timeout and a read timeout catch a dead server and a stalled one,
-/// and leave a slow download alone for as long as it keeps moving.
-///
-/// It follows no redirect itself: [`follow`] does, and decides at each hop
-/// whether the credential goes along.
-fn http_client(connect: Duration, read: Duration) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .gzip(true)
-        .connect_timeout(connect)
-        .read_timeout(read)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("building the HTTP client")
-}
+/// A module so the boundary is enforced, not remembered: the client sits in a
+/// private field of [`Http`], and a response only leaves as an [`Answer`]
+/// whose reads are the ones below. A reqwest error carries the full URL of its
+/// request and every error ends up printed, while a CDN location is a signed
+/// link anyone holding it can download with. So the URL comes off every error
+/// here, request and body read alike, and a call site added later has no way
+/// to send or read around that.
+mod http {
+    use std::time::Duration;
 
-/// As many redirects as one request may follow: reqwest's own default.
-const MAX_REDIRECTS: usize = 10;
+    use anyhow::{bail, Context, Result};
+    use rbx_core::api::{execute_with_retry_policy, ApiError, RetryPolicy};
 
-/// GET `url` through [`follow`], retrying what is worth retrying.
-///
-/// Every request here is a GET that changes nothing, so sending it again is
-/// always safe: a 429, a 5xx, a timeout or a failed connection is retried with
-/// backoff, as the retry layer does. Only the request is retried, up to its
-/// response headers; a body that breaks off halfway fails that asset.
-///
-/// A failure that came with an answer gets the sentence `refused` makes of it
-/// for that endpoint, as context on top of what the retry layer said rather
-/// than in its place: the status and body stay underneath, and so does a
-/// "this limit reopens in 300s, run the same command again after that".
-async fn get(
-    ctx: &Ctx,
-    url: &str,
-    credential: Option<(&str, &str)>,
-    refused: impl FnOnce(&ApiError) -> String,
-) -> Result<reqwest::Response> {
-    execute_with_retry_policy(|| follow(ctx, url, credential), &ctx.retry)
-        .await
-        .map_err(|error| {
-            let sentence = error.downcast_ref::<ApiError>().map(refused);
-            match sentence {
-                Some(sentence) => error.context(sentence),
-                None => error,
-            }
-        })
-}
+    /// As many redirects as one request may follow: reqwest's own default.
+    const MAX_REDIRECTS: usize = 10;
 
-/// GET `url`, with a credential header if one is given, following redirects.
-///
-/// The delivery endpoints redirect to a CDN. reqwest drops `Authorization`
-/// and `Cookie` when a redirect leaves the host, but forwards every other
-/// header, `x-api-key` included, so the client follows nothing and this does
-/// it instead. The credential goes with a hop only while every hop so far has
-/// stayed on the origin it was given for (scheme, host and port), and once
-/// dropped it stays dropped.
-///
-/// A reqwest error carries the full URL of its request, and every error ends
-/// up printed. A CDN location is signed, a download link anyone holding it can
-/// use, so the URL comes off every error here, on the first hop as well, which
-/// needs it least. Body reads strip it too: reqwest 0.12 puts no URL on a body
-/// error, and that is its choice to change, not a promise.
-async fn follow(
-    ctx: &Ctx,
-    url: &str,
-    credential: Option<(&str, &str)>,
-) -> Result<reqwest::Response> {
-    // Not `{url}` in the message: a download location is a signed URL.
-    let mut url = reqwest::Url::parse(url).context("the address to download from is not a URL")?;
-    let origin = url.origin();
-    let mut credential = credential;
-    for _ in 0..=MAX_REDIRECTS {
-        let mut request = ctx.client.get(url.clone());
-        if let Some((name, value)) = credential {
-            request = request.header(name, value);
-        }
-        let response = request.send().await.map_err(reqwest::Error::without_url)?;
-        if !response.status().is_redirection() {
-            return Ok(response);
-        }
-        let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
-            return Ok(response);
-        };
-        let next = location
-            .to_str()
-            .ok()
-            .and_then(|location| url.join(location).ok())
-            .with_context(|| {
-                format!(
-                    "{} redirected to an unreadable location",
-                    url.host_str().unwrap_or("the server")
-                )
-            })?;
-        if next.origin() != origin {
-            credential = None;
-        }
-        url = next;
+    /// The client every request goes through, and how it retries.
+    #[derive(Debug)]
+    pub(super) struct Http {
+        client: reqwest::Client,
+        retry: RetryPolicy,
     }
-    bail!("more than {MAX_REDIRECTS} redirects")
+
+    /// A response that succeeded, readable only through methods that keep the
+    /// URL out of their errors.
+    #[derive(Debug)]
+    pub(super) struct Answer(reqwest::Response);
+
+    impl Answer {
+        pub(super) fn headers(&self) -> &reqwest::header::HeaderMap {
+            self.0.headers()
+        }
+
+        /// reqwest 0.12 puts no URL on a body error. That is its choice to
+        /// change, not a promise, so the URL is stripped here as well.
+        pub(super) async fn bytes(self) -> Result<Vec<u8>> {
+            Ok(self
+                .0
+                .bytes()
+                .await
+                .map_err(reqwest::Error::without_url)?
+                .to_vec())
+        }
+
+        pub(super) async fn json(self) -> Result<serde_json::Value> {
+            Ok(self.0.json().await.map_err(reqwest::Error::without_url)?)
+        }
+    }
+
+    impl Http {
+        /// No total timeout: one would cap the whole transfer, body included,
+        /// and cut a large place on a slow link off while its bytes are still
+        /// arriving. A connect timeout and a read timeout catch a dead server
+        /// and a stalled one, and leave a slow download alone for as long as
+        /// it keeps moving.
+        ///
+        /// The client follows no redirect itself: [`Http::follow`] does, and
+        /// decides at each hop whether the credential goes along.
+        pub(super) fn new(connect: Duration, read: Duration, retry: RetryPolicy) -> Result<Self> {
+            let client = reqwest::Client::builder()
+                .gzip(true)
+                .connect_timeout(connect)
+                .read_timeout(read)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .context("building the HTTP client")?;
+            Ok(Self { client, retry })
+        }
+
+        /// GET `url` through [`Http::follow`], retrying what is worth retrying.
+        ///
+        /// Every request here is a GET that changes nothing, so sending it
+        /// again is always safe: a 429, a 5xx, a timeout or a failed
+        /// connection is retried with backoff, as the retry layer does. Only
+        /// the request is retried, up to its response headers; a body that
+        /// breaks off halfway fails that asset.
+        ///
+        /// A failure that came with an answer gets the sentence `refused`
+        /// makes of it for that endpoint, as context on top of what the retry
+        /// layer said rather than in its place: the status and body stay
+        /// underneath, and so does a "this limit reopens in 300s, run the same
+        /// command again after that".
+        pub(super) async fn get(
+            &self,
+            url: &str,
+            credential: Option<(&str, &str)>,
+            refused: impl FnOnce(&ApiError) -> String,
+        ) -> Result<Answer> {
+            execute_with_retry_policy(|| self.follow(url, credential), &self.retry)
+                .await
+                .map(Answer)
+                .map_err(|error| {
+                    let sentence = error.downcast_ref::<ApiError>().map(refused);
+                    match sentence {
+                        Some(sentence) => error.context(sentence),
+                        None => error,
+                    }
+                })
+        }
+
+        /// GET `url`, with a credential header if one is given, following
+        /// redirects.
+        ///
+        /// The delivery endpoints redirect to a CDN. reqwest drops
+        /// `Authorization` and `Cookie` when a redirect leaves the host, but
+        /// forwards every other header, `x-api-key` included, so the client
+        /// follows nothing and this does it instead. The credential goes with
+        /// a hop only while every hop so far has stayed on the origin it was
+        /// given for (scheme, host and port), and once dropped it stays
+        /// dropped.
+        async fn follow(
+            &self,
+            url: &str,
+            credential: Option<(&str, &str)>,
+        ) -> Result<reqwest::Response> {
+            // Not `{url}` in the message: a download location is a signed URL.
+            let mut url =
+                reqwest::Url::parse(url).context("the address to download from is not a URL")?;
+            let origin = url.origin();
+            let mut credential = credential;
+            for _ in 0..=MAX_REDIRECTS {
+                let mut request = self.client.get(url.clone());
+                if let Some((name, value)) = credential {
+                    request = request.header(name, value);
+                }
+                let response = request.send().await.map_err(reqwest::Error::without_url)?;
+                if !response.status().is_redirection() {
+                    return Ok(response);
+                }
+                let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                    return Ok(response);
+                };
+                let next = location
+                    .to_str()
+                    .ok()
+                    .and_then(|location| url.join(location).ok())
+                    .with_context(|| {
+                        format!(
+                            "{} redirected to an unreadable location",
+                            url.host_str().unwrap_or("the server")
+                        )
+                    })?;
+                if next.origin() != origin {
+                    credential = None;
+                }
+                url = next;
+            }
+            bail!("more than {MAX_REDIRECTS} redirects")
+        }
+    }
 }
 
 struct Ctx {
-    client: reqwest::Client,
+    http: Http,
     hosts: Hosts,
     cookie_header: Option<String>,
     api_key: Option<String>,
@@ -397,8 +449,6 @@ struct Ctx {
     force: bool,
     /// `(extension, type_id)` from --type, when given.
     forced: Option<(String, Option<i64>)>,
-    /// How [`get`] retries. The default outside tests, which do not wait.
-    retry: RetryPolicy,
 }
 
 async fn download_one(ctx: &Ctx, id: u64) -> Result<Saved> {
@@ -439,43 +489,42 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
                 Some(v) => cloud.join(&format!("/asset-delivery-api/v1/assetId/{id}/version/{v}")),
                 None => cloud.join(&format!("/asset-delivery-api/v1/assetId/{id}")),
             };
-            let resp = get(ctx, &url, Some(("x-api-key", key)), |_| {
-                "the asset-delivery lookup failed".to_string()
-            })
-            .await?;
-            let meta: serde_json::Value = resp.json().await.map_err(reqwest::Error::without_url)?;
+            let resp = ctx
+                .http
+                .get(&url, Some(("x-api-key", key)), |_| {
+                    "the asset-delivery lookup failed".to_string()
+                })
+                .await?;
+            let meta = resp.json().await?;
             let location = meta
                 .get("location")
                 .and_then(|v| v.as_str())
                 .context("no download location in asset-delivery response")?;
             // No key: the location carries its own authorisation, and is a
             // host this code did not choose.
-            let dl = get(ctx, location, None, |_| {
-                "the CDN download failed".to_string()
-            })
-            .await?;
-            Ok(dl
-                .bytes()
-                .await
-                .map_err(reqwest::Error::without_url)?
-                .to_vec())
+            let dl = ctx
+                .http
+                .get(location, None, |_| "the CDN download failed".to_string())
+                .await?;
+            dl.bytes().await
         }
         Source::Public => {
             let delivery = &ctx.hosts.delivery;
             let url = delivery.join(&format!("/v1/asset/?id={id}"));
-            let resp = get(ctx, &url, cookie(ctx), |answer| {
-                public_refusal(answer.body().as_bytes())
-                    .unwrap_or_else(|| "assetdelivery refused the download".to_string())
-            })
-            .await?;
+            let resp = ctx
+                .http
+                .get(&url, cookie(ctx), |answer| {
+                    public_refusal(answer.body().as_bytes())
+                        .unwrap_or_else(|| "assetdelivery refused the download".to_string())
+                })
+                .await?;
             let is_json = resp
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.contains("application/json"))
                 .unwrap_or(false);
-            // After a redirect, the response's URL is the signed CDN one.
-            let bytes = resp.bytes().await.map_err(reqwest::Error::without_url)?;
+            let bytes = resp.bytes().await?;
             if is_json {
                 // Body is an error payload, not the asset.
                 bail!(
@@ -483,7 +532,7 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
                     public_refusal(&bytes).unwrap_or_else(|| NOT_AVAILABLE.to_string())
                 );
             }
-            Ok(bytes.to_vec())
+            Ok(bytes)
         }
     }
 }
@@ -503,7 +552,7 @@ fn public_refusal(body: &[u8]) -> Option<String> {
 /// The public endpoint's refusal when its JSON body names no reason.
 const NOT_AVAILABLE: &str = "asset not available (may be private or moderated)";
 
-/// The `Cookie` header for [`get`], when the run has a session.
+/// The `Cookie` header for [`Http::get`], when the run has a session.
 fn cookie(ctx: &Ctx) -> Option<(&str, &str)> {
     ctx.cookie_header.as_deref().map(|value| ("cookie", value))
 }
@@ -512,11 +561,13 @@ fn cookie(ctx: &Ctx) -> Option<(&str, &str)> {
 async fn fetch_details(ctx: &Ctx, id: u64) -> Result<(Option<String>, Option<i64>)> {
     let economy = &ctx.hosts.economy;
     let url = economy.join(&format!("/v2/assets/{id}/details"));
-    let resp = get(ctx, &url, cookie(ctx), |_| {
-        "the economy details lookup failed (tip: pass --type to skip it)".to_string()
-    })
-    .await?;
-    let v: serde_json::Value = resp.json().await.map_err(reqwest::Error::without_url)?;
+    let resp = ctx
+        .http
+        .get(&url, cookie(ctx), |_| {
+            "the economy details lookup failed (tip: pass --type to skip it)".to_string()
+        })
+        .await?;
+    let v = resp.json().await?;
     let name = v.get("Name").and_then(|n| n.as_str()).map(str::to_string);
     let type_id = v.get("AssetTypeId").and_then(|t| t.as_i64());
     Ok((name, type_id))
@@ -810,7 +861,7 @@ mod tests {
     /// [`ctx`] against any address, for the servers that are not mocks.
     fn ctx_at(base: &str, source: Source, api_key: Option<&str>) -> Ctx {
         Ctx {
-            client: http_client(CONNECT_TIMEOUT, READ_TIMEOUT).unwrap(),
+            http: Http::new(CONNECT_TIMEOUT, READ_TIMEOUT, NO_WAIT).unwrap(),
             hosts: Hosts {
                 cloud: ApiBase::new(base),
                 delivery: ApiBase::new(base),
@@ -824,7 +875,6 @@ mod tests {
             raw: false,
             force: false,
             forced: None,
-            retry: NO_WAIT,
         }
     }
 
@@ -1071,7 +1121,7 @@ mod tests {
 
     fn ctx_against(base: &str, read_timeout: Duration) -> Ctx {
         Ctx {
-            client: http_client(CONNECT_TIMEOUT, read_timeout).unwrap(),
+            http: Http::new(CONNECT_TIMEOUT, read_timeout, NO_WAIT).unwrap(),
             ..ctx_at(base, Source::Public, None)
         }
     }
@@ -1425,7 +1475,7 @@ mod tests {
             .mount(&delivery)
             .await;
         let ctx = Ctx {
-            client: http_client(CONNECT_TIMEOUT, Duration::from_millis(300)).unwrap(),
+            http: Http::new(CONNECT_TIMEOUT, Duration::from_millis(300), NO_WAIT).unwrap(),
             ..ctx(&delivery, Source::Public, None)
         };
 
