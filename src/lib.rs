@@ -537,7 +537,7 @@ fn save(ctx: &Ctx, id: u64, name: &Option<String>, ext: &str, bytes: &[u8]) -> R
     if ctx.force {
         // The same bytes are left alone under `--force` too: nothing to
         // overwrite, and the file keeps its modification time.
-        if std::fs::read(&path).is_ok_and(|existing| existing == bytes) {
+        if same_contents(&path, bytes).unwrap_or(false) {
             return Ok(Saved::AlreadyThere(filename));
         }
         std::fs::write(&path, bytes).with_context(writing)?;
@@ -563,9 +563,9 @@ fn save(ctx: &Ctx, id: u64, name: &Option<String>, ext: &str, bytes: &[u8]) -> R
             Ok(Saved::Written(filename))
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing =
-                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            if existing == bytes {
+            let same = same_contents(&path, bytes)
+                .with_context(|| format!("reading {}", path.display()))?;
+            if same {
                 Ok(Saved::AlreadyThere(filename))
             } else {
                 Ok(Saved::Refused(path))
@@ -573,6 +573,27 @@ fn save(ctx: &Ctx, id: u64, name: &Option<String>, ext: &str, bytes: &[u8]) -> R
         }
         Err(e) => Err(e).with_context(writing),
     }
+}
+
+/// Whether the file at `path` holds exactly `bytes`.
+fn same_contents(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<bool> {
+    let len = std::fs::metadata(path)?.len();
+    same_contents_as(len, || std::fs::read(path), bytes)
+}
+
+/// [`same_contents`] with the file's size and its reading passed in. A file
+/// of another size is different without reading it: a place file can run to
+/// hundreds of megabytes, and a different size is the common case for another
+/// version.
+fn same_contents_as(
+    len: u64,
+    read: impl FnOnce() -> std::io::Result<Vec<u8>>,
+    bytes: &[u8],
+) -> std::io::Result<bool> {
+    if len != bytes.len() as u64 {
+        return Ok(false);
+    }
+    Ok(read()? == bytes)
 }
 
 fn read_ids_file(path: &PathBuf) -> Result<Vec<u64>> {
@@ -796,6 +817,15 @@ mod tests {
 
         download_all(&ctx, &[42]).await.unwrap();
         assert_eq!(std::fs::read(dir.path().join("42.rbxm")).unwrap(), b"v2");
+    }
+
+    /// A file of another size is different, and is not read to find out.
+    #[test]
+    fn a_file_of_another_size_is_not_read() {
+        let read = || -> std::io::Result<Vec<u8>> { panic!("read a file of another size") };
+        assert!(!same_contents_as(3, read, b"four").unwrap());
+        assert!(same_contents_as(4, || Ok(b"four".to_vec()), b"four").unwrap());
+        assert!(!same_contents_as(4, || Ok(b"five".to_vec()), b"four").unwrap());
     }
 
     /// `--force` overwrites what is different. What is the same is still
