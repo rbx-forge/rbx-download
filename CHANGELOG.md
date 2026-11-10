@@ -5,7 +5,7 @@
 ### Fixed
 
 - An ids file takes the comments its help describes: `#` starts a comment that runs to the end of the line, on a line of its own or after an id, words and all. An id that does not parse is reported with its line number.
-- A download does not write over a file that is already there. The same bytes are left alone and reported as `already there`. Different bytes, such as another version of the same asset under the same name, refuse that asset with the file's path, and the run exits non-zero once the other ids are done. `--force` overwrites different bytes, and still leaves the same ones alone.
+- A download does not write over a file that is already there. The same bytes are left alone and reported as `already there`. Different bytes, such as another version of the same asset under the same name, refuse that asset with the file's path, and the run exits non-zero once the other ids are done. `--force` overwrites different bytes, and still leaves the same ones alone. A file of another size is known to differ without being read.
 - A large asset on a slow link is not cut off while its bytes keep arriving: a connection gets 30 seconds to open and the server 60 seconds of silence, with no cap on the transfer as a whole.
 - A rate limit, a server error, a timeout or a failed connection does not fail an asset on the first try. The request is sent again up to three times with backoff, or after as long as a rate limit asks for. A rate limit that asks for more than two minutes fails the asset with how long it asked for.
 - A failed asset's line shows the whole error: the endpoint's sentence, then the status and body Roblox answered with.
