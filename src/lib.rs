@@ -535,6 +535,11 @@ fn save(ctx: &Ctx, id: u64, name: &Option<String>, ext: &str, bytes: &[u8]) -> R
     let writing = || format!("writing {}", path.display());
 
     if ctx.force {
+        // The same bytes are left alone under `--force` too: nothing to
+        // overwrite, and the file keeps its modification time.
+        if std::fs::read(&path).is_ok_and(|existing| existing == bytes) {
+            return Ok(Saved::AlreadyThere(filename));
+        }
         std::fs::write(&path, bytes).with_context(writing)?;
         return Ok(Saved::Written(filename));
     }
@@ -791,6 +796,23 @@ mod tests {
 
         download_all(&ctx, &[42]).await.unwrap();
         assert_eq!(std::fs::read(dir.path().join("42.rbxm")).unwrap(), b"v2");
+    }
+
+    /// `--force` overwrites what is different. What is the same is still
+    /// already there.
+    #[tokio::test]
+    async fn force_still_leaves_the_same_bytes_alone() {
+        let server = MockServer::start().await;
+        serve_public(&server, 42, b"v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("42.rbxm"), b"v1").unwrap();
+        let ctx = Ctx {
+            force: true,
+            ..ctx_writing_to(&server, &dir)
+        };
+
+        let saved = download_one(&ctx, 42).await.unwrap();
+        assert_eq!(saved, Saved::AlreadyThere("42.rbxm".to_string()));
     }
 
     /// A server that answers one request with `body`, sent in `pieces` parts

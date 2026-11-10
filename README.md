@@ -89,7 +89,7 @@ Files are saved as `<id>_<sanitized name>.<ext>` (or `<id>.<ext>` when the name 
 
 The filename does not carry the asset version, so two versions of one asset share a name. When the file is already there:
 
-- with the same bytes, it is left alone and reported as `already there`;
+- with the same bytes, it is left alone and reported as `already there`, with or without `--force`;
 - with different bytes, that asset is refused with the file's path, the other ids still download, and the run exits non-zero. `--force` overwrites it instead.
 
 ## Network
