@@ -776,15 +776,27 @@ impl PartFile {
     /// A hard link refuses an existing target in one step, the promise
     /// `create_new` makes, and the part is then dropped. A file system without
     /// hard links (FAT, some network shares) gets a check and a rename instead,
-    /// which leaves a moment between the two.
+    /// which leaves a moment between the two. Any other failure, a sharing
+    /// violation or a denied access, is that asset's error.
     fn place_new(self, target: &std::path::Path) -> std::io::Result<()> {
         match std::fs::hard_link(&self.path, target) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+            Err(e) if !hard_links_unsupported(&e) => Err(e),
             Err(_) if target.try_exists()? => Err(std::io::ErrorKind::AlreadyExists.into()),
             Err(_) => std::fs::rename(&self.path, target),
         }
     }
+}
+
+/// Whether a failed hard link means the file system has none.
+///
+/// `Unsupported` where the platform says so. Windows answers a volume without
+/// hard links with `ERROR_INVALID_FUNCTION` (1) or `ERROR_NOT_SUPPORTED` (50),
+/// which std does not map to `Unsupported`. Those numbers mean other things
+/// elsewhere (1 is `EPERM` on Unix), hence the platform check.
+fn hard_links_unsupported(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+        || (cfg!(windows) && matches!(error.raw_os_error(), Some(1 | 50)))
 }
 
 impl Drop for PartFile {
@@ -1151,6 +1163,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(names_in(dir.path()), ["42.rbxm", "43.rbxm"]);
+    }
+
+    /// Only "no hard links here" falls back to a check and a rename. A denied
+    /// access or a file held open elsewhere is an error, not a reason to take
+    /// the weaker path.
+    #[test]
+    fn only_missing_hard_links_fall_back() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(hard_links_unsupported(&Error::from(ErrorKind::Unsupported)));
+        assert!(!hard_links_unsupported(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!hard_links_unsupported(&Error::from(ErrorKind::NotFound)));
+        // ERROR_SHARING_VIOLATION and ERROR_ACCESS_DENIED.
+        assert!(!hard_links_unsupported(&Error::from_raw_os_error(32)));
+        assert!(!hard_links_unsupported(&Error::from_raw_os_error(5)));
+        // ERROR_INVALID_FUNCTION and ERROR_NOT_SUPPORTED on Windows; EPERM
+        // and a socket error elsewhere.
+        for code in [1, 50] {
+            assert_eq!(
+                hard_links_unsupported(&Error::from_raw_os_error(code)),
+                cfg!(windows),
+                "os error {code}"
+            );
+        }
     }
 
     /// A link found at the part's name is replaced, not written through: the
