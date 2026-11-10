@@ -24,7 +24,7 @@ use colored::Colorize;
 
 use rbx_core::api::{ApiBase, RetryPolicy};
 
-use http::Http;
+use http::{Endpoint, Http};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -292,13 +292,96 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// here, request and body read alike, and a call site added later has no way
 /// to send or read around that.
 mod http {
+    use std::cell::Cell;
+    use std::fmt;
     use std::time::Duration;
 
     use anyhow::{bail, Context, Result};
     use rbx_core::api::{execute_with_retry_policy, ApiError, RetryPolicy};
+    use reqwest::StatusCode;
 
     /// As many redirects as one request may follow: reqwest's own default.
     const MAX_REDIRECTS: usize = 10;
+
+    /// How much of a refusal's body is shown, in characters.
+    const SHOWN_BODY_CHARS: usize = 300;
+
+    /// How one endpoint's refusals are told.
+    #[derive(Debug)]
+    pub(super) struct Endpoint {
+        /// The sentence a refusal opens with.
+        pub(super) failed: &'static str,
+        /// Whether a refusal's body may be shown. Never for a CDN: an
+        /// S3-style refusal echoes the signature and the string it signed.
+        pub(super) body_is_safe: bool,
+        /// The endpoint's own sentence read out of a refusal's body. It then
+        /// stands in for `failed`, and the body is not shown a second time.
+        pub(super) sentence_in_body: fn(&str) -> Option<String>,
+    }
+
+    impl Endpoint {
+        /// The sentence when the refusal came from wherever a redirect led,
+        /// which is not this endpoint and whose body is not safe either.
+        const REDIRECTED: &'static str = "the download it redirected to failed";
+
+        fn tell(&self, error: anyhow::Error, answered_elsewhere: bool) -> anyhow::Error {
+            let Some(answer) = error.downcast_ref::<ApiError>() else {
+                return error;
+            };
+            let (sentence, body) = if answered_elsewhere {
+                (Self::REDIRECTED.to_string(), None)
+            } else if !self.body_is_safe {
+                (self.failed.to_string(), None)
+            } else if let Some(sentence) = (self.sentence_in_body)(answer.body()) {
+                (sentence, None)
+            } else {
+                (self.failed.to_string(), shown_body(answer.body()))
+            };
+            let refused = Refused {
+                status: answer.status(),
+                body,
+            };
+            // The retry layer puts its own sentence on top of the answer when
+            // it has one, a wait too long to sit out.
+            let retry_said = (error.chain().count() > 1).then(|| error.to_string());
+            let mut told = anyhow::Error::new(refused);
+            if let Some(said) = retry_said {
+                told = told.context(said);
+            }
+            told.context(sentence)
+        }
+    }
+
+    /// A body as a refusal shows it: on one line, and cut short.
+    fn shown_body(body: &str) -> Option<String> {
+        let one_line = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one_line.is_empty() {
+            return None;
+        }
+        if one_line.chars().count() <= SHOWN_BODY_CHARS {
+            return Some(one_line);
+        }
+        let cut: String = one_line.chars().take(SHOWN_BODY_CHARS).collect();
+        Some(format!("{cut}..."))
+    }
+
+    /// The status of a refusal, and as much of its body as may be shown.
+    #[derive(Debug)]
+    struct Refused {
+        status: StatusCode,
+        body: Option<String>,
+    }
+
+    impl fmt::Display for Refused {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match &self.body {
+                Some(body) => write!(f, "{}: {body}", self.status),
+                None => write!(f, "{}", self.status),
+            }
+        }
+    }
+
+    impl std::error::Error for Refused {}
 
     /// The client every request goes through, and how it retries.
     #[derive(Debug)]
@@ -361,27 +444,25 @@ mod http {
         /// the request is retried, up to its response headers; a body that
         /// breaks off halfway fails that asset.
         ///
-        /// A failure that came with an answer gets the sentence `refused`
-        /// makes of it for that endpoint, as context on top of what the retry
-        /// layer said rather than in its place: the status and body stay
-        /// underneath, and so does a "this limit reopens in 300s, run the same
-        /// command again after that".
+        /// A failure that came with an answer is told as the endpoint's
+        /// sentence, then what the retry layer said on top of the answer when
+        /// it said anything (a "this limit reopens in 300s, run the same
+        /// command again after that"), then the status, and the body only
+        /// where [`Endpoint`] allows it.
         pub(super) async fn get(
             &self,
             url: &str,
             credential: Option<(&str, &str)>,
-            refused: impl FnOnce(&ApiError) -> String,
+            endpoint: &Endpoint,
         ) -> Result<Answer> {
-            execute_with_retry_policy(|| self.follow(url, credential), &self.retry)
-                .await
-                .map(Answer)
-                .map_err(|error| {
-                    let sentence = error.downcast_ref::<ApiError>().map(refused);
-                    match sentence {
-                        Some(sentence) => error.context(sentence),
-                        None => error,
-                    }
-                })
+            let answered_elsewhere = Cell::new(false);
+            execute_with_retry_policy(
+                || self.follow(url, credential, &answered_elsewhere),
+                &self.retry,
+            )
+            .await
+            .map(Answer)
+            .map_err(|error| endpoint.tell(error, answered_elsewhere.get()))
         }
 
         /// GET `url`, with a credential header if one is given, following
@@ -394,10 +475,14 @@ mod http {
         /// a hop only while every hop so far has stayed on the origin it was
         /// given for (scheme, host and port), and once dropped it stays
         /// dropped.
+        ///
+        /// `answered_elsewhere` says whether the response that ends the chain
+        /// came from another origin than `url`'s: a CDN, after a redirect.
         async fn follow(
             &self,
             url: &str,
             credential: Option<(&str, &str)>,
+            answered_elsewhere: &Cell<bool>,
         ) -> Result<reqwest::Response> {
             // Not `{url}` in the message: a download location is a signed URL.
             let mut url =
@@ -410,6 +495,7 @@ mod http {
                     request = request.header(name, value);
                 }
                 let response = request.send().await.map_err(reqwest::Error::without_url)?;
+                answered_elsewhere.set(url.origin() != origin);
                 if !response.status().is_redirection() {
                     return Ok(response);
                 }
@@ -491,9 +577,7 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
             };
             let resp = ctx
                 .http
-                .get(&url, Some(("x-api-key", key)), |_| {
-                    "the asset-delivery lookup failed".to_string()
-                })
+                .get(&url, Some(("x-api-key", key)), &ASSET_DELIVERY)
                 .await?;
             let meta = resp.json().await?;
             let location = meta
@@ -502,22 +586,13 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
                 .context("no download location in asset-delivery response")?;
             // No key: the location carries its own authorisation, and is a
             // host this code did not choose.
-            let dl = ctx
-                .http
-                .get(location, None, |_| "the CDN download failed".to_string())
-                .await?;
+            let dl = ctx.http.get(location, None, &CDN).await?;
             dl.bytes().await
         }
         Source::Public => {
             let delivery = &ctx.hosts.delivery;
             let url = delivery.join(&format!("/v1/asset/?id={id}"));
-            let resp = ctx
-                .http
-                .get(&url, cookie(ctx), |answer| {
-                    public_refusal(answer.body().as_bytes())
-                        .unwrap_or_else(|| "assetdelivery refused the download".to_string())
-                })
-                .await?;
+            let resp = ctx.http.get(&url, cookie(ctx), &PUBLIC_DELIVERY).await?;
             let is_json = resp
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
@@ -535,6 +610,41 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
             Ok(bytes)
         }
     }
+}
+
+/// The Open Cloud lookup that names the download location.
+const ASSET_DELIVERY: Endpoint = Endpoint {
+    failed: "the asset-delivery lookup failed",
+    body_is_safe: true,
+    sentence_in_body: no_sentence,
+};
+
+/// The download location the lookup names: signed, and so is its refusal.
+const CDN: Endpoint = Endpoint {
+    failed: "the CDN download failed",
+    body_is_safe: false,
+    sentence_in_body: no_sentence,
+};
+
+/// The public endpoint, whose refusals are JSON with a sentence inside.
+const PUBLIC_DELIVERY: Endpoint = Endpoint {
+    failed: "assetdelivery refused the download",
+    body_is_safe: true,
+    sentence_in_body: public_sentence,
+};
+
+const ECONOMY_DETAILS: Endpoint = Endpoint {
+    failed: "the economy details lookup failed (tip: pass --type to skip it)",
+    body_is_safe: true,
+    sentence_in_body: no_sentence,
+};
+
+fn no_sentence(_body: &str) -> Option<String> {
+    None
+}
+
+fn public_sentence(body: &str) -> Option<String> {
+    public_refusal(body.as_bytes())
 }
 
 /// What the public endpoint's JSON error body says, when the body is JSON.
@@ -561,12 +671,7 @@ fn cookie(ctx: &Ctx) -> Option<(&str, &str)> {
 async fn fetch_details(ctx: &Ctx, id: u64) -> Result<(Option<String>, Option<i64>)> {
     let economy = &ctx.hosts.economy;
     let url = economy.join(&format!("/v2/assets/{id}/details"));
-    let resp = ctx
-        .http
-        .get(&url, cookie(ctx), |_| {
-            "the economy details lookup failed (tip: pass --type to skip it)".to_string()
-        })
-        .await?;
+    let resp = ctx.http.get(&url, cookie(ctx), &ECONOMY_DETAILS).await?;
     let v = resp.json().await?;
     let name = v.get("Name").and_then(|n| n.as_str()).map(str::to_string);
     let type_id = v.get("AssetTypeId").and_then(|t| t.as_i64());
@@ -1482,6 +1587,115 @@ mod tests {
         let error = download_bytes(&ctx, 42, None).await.unwrap_err();
         let shown = format!("{error:?}");
         assert!(!shown.contains(SIGNATURE), "got: {shown}");
+    }
+
+    /// An S3-style refusal from a CDN, which echoes what was signed.
+    fn cdn_refusal() -> ResponseTemplate {
+        ResponseTemplate::new(403).set_body_string(format!(
+            "<Error><Code>SignatureDoesNotMatch</Code><StringToSign>{SIGNATURE}</StringToSign></Error>"
+        ))
+    }
+
+    fn assert_no_cdn_body(shown: &str) {
+        assert!(!shown.contains("SignatureDoesNotMatch"), "got: {shown}");
+        assert!(!shown.contains(SIGNATURE), "got: {shown}");
+    }
+
+    /// The CDN's refusal is told by its status alone.
+    #[tokio::test]
+    async fn a_cdn_refusal_shows_its_status_and_not_its_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/asset-delivery-api/v1/assetId/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "location": format!("{}/cdn/blob", server.uri())
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/cdn/blob"))
+            .respond_with(cdn_refusal())
+            .mount(&server)
+            .await;
+
+        let error = download_bytes(&ctx(&server, Source::Cloud, Some("k")), 42, None)
+            .await
+            .unwrap_err();
+        let shown = format!("{error:#}");
+        assert!(shown.contains("the CDN download failed"), "got: {shown}");
+        assert!(shown.contains("403"), "got: {shown}");
+        assert_no_cdn_body(&shown);
+    }
+
+    /// A refusal from where the public endpoint redirected is the CDN's, not
+    /// the endpoint's, and its body is the CDN's too.
+    #[tokio::test]
+    async fn a_refusal_after_a_redirect_is_not_the_endpoints() {
+        let delivery = MockServer::start().await;
+        let cdn = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/asset/"))
+            .respond_with(redirect_to(format!("{}/blob", cdn.uri())))
+            .mount(&delivery)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/blob"))
+            .respond_with(cdn_refusal())
+            .mount(&cdn)
+            .await;
+
+        let error = download_bytes(&ctx(&delivery, Source::Public, None), 42, None)
+            .await
+            .unwrap_err();
+        let shown = format!("{error:#}");
+        assert!(shown.contains("redirected to failed"), "got: {shown}");
+        assert!(!shown.contains("assetdelivery"), "got: {shown}");
+        assert_no_cdn_body(&shown);
+    }
+
+    /// The public endpoint's sentence is read from its body, so the body is
+    /// not printed again underneath it.
+    #[tokio::test]
+    async fn the_public_endpoints_sentence_is_shown_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/asset/"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "errors": [{"code": 0, "message": "Request asset was not found"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let error = download_bytes(&ctx(&server, Source::Public, None), 42, None)
+            .await
+            .unwrap_err();
+        let shown = format!("{error:#}");
+        assert_eq!(
+            shown.matches("Request asset was not found").count(),
+            1,
+            "got: {shown}"
+        );
+        assert!(shown.contains("403"), "got: {shown}");
+    }
+
+    /// A body that is shown is cut short and kept on one line.
+    #[tokio::test]
+    async fn a_long_body_is_cut_short() {
+        let server = MockServer::start().await;
+        let body = format!("<html>\n{}\n</html>", "x".repeat(5000));
+        Mock::given(method("GET"))
+            .and(path("/v2/assets/42/details"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let error = fetch_details(&ctx(&server, Source::Public, None), 42)
+            .await
+            .unwrap_err();
+        let shown = format!("{error:#}");
+        assert!(shown.contains("<html> xxx"), "got: {shown}");
+        assert!(shown.ends_with("..."), "got: {shown}");
+        assert!(shown.len() < 500, "{} characters", shown.len());
     }
 
     /// A request that times out waiting for its answer is sent again.
