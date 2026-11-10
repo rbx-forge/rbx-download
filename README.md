@@ -33,18 +33,26 @@ rbx-download 123456789
 # Several at once, into a chosen folder
 rbx-download 123 456 789 -o assets
 
-# From a file (whitespace/comma separated, # comments allowed)
+# From a file (format below)
 rbx-download --file ids.txt
 
 # A specific version, through Open Cloud (reads the key from RBX_API_KEY)
 rbx-download 123456789 --asset-version 3
 ```
 
+An ids file separates its ids with spaces, commas or newlines, and `#` starts a comment that runs to the end of the line, on a line of its own or after an id. Blank lines are fine:
+
+```text
+# hats for the lobby
+1234567890, 1234567891
+1234567892  # the one with the feather
+```
+
 With several ids, each one is attempted and reported on its own line. One that fails does not stop the others; the run ends with a count, and exits non-zero if any failed.
 
 ## Options
 
-- `-f, --file <path>`: read additional asset ids from a file
+- `-f, --file <path>`: read additional asset ids from a file (format above)
 - `-o, --output <dir>`: output directory (default: `downloads`)
 - `--public`: force the public assetdelivery backend even when an API key is set
 - `--type <id|alias>`: skip the economy metadata lookup by giving the asset type yourself. Aliases: `image`, `audio`, `mesh`, `lua`, `place`, `model`, `animation`, `video`, `font`
