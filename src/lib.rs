@@ -18,10 +18,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use colored::Colorize;
-use reqwest::StatusCode;
 
 use rbx_core::api::{execute_with_retry_policy, ApiBase, ApiError, RetryPolicy};
 
@@ -212,7 +211,9 @@ async fn download_all(ctx: &Ctx, ids: &[u64]) -> Result<()> {
                 refused += 1;
             }
             Err(e) => {
-                println!("  {} asset {}: {}", "✗".red(), id, e);
+                // `{:#}`: the whole chain on one line, so the status, the body
+                // and a wait too long to sit out are shown with the sentence.
+                println!("  {} asset {}: {:#}", "✗".red(), id, e);
                 failed += 1;
             }
         }
@@ -308,19 +309,24 @@ const MAX_REDIRECTS: usize = 10;
 /// backoff, as the retry layer does. Only the request is retried, up to its
 /// response headers; a body that breaks off halfway fails that asset.
 ///
-/// A failure that came with an answer reaches `refused` with its status and
-/// body, which turns it into the sentence for that endpoint.
+/// A failure that came with an answer gets the sentence `refused` makes of it
+/// for that endpoint, as context on top of what the retry layer said rather
+/// than in its place: the status and body stay underneath, and so does a
+/// "this limit reopens in 300s, run the same command again after that".
 async fn get(
     ctx: &Ctx,
     url: &str,
     credential: Option<(&str, &str)>,
-    refused: impl FnOnce(StatusCode, &str) -> anyhow::Error,
+    refused: impl FnOnce(&ApiError) -> String,
 ) -> Result<reqwest::Response> {
     execute_with_retry_policy(|| follow(ctx, url, credential), &ctx.retry)
         .await
-        .map_err(|error| match error.downcast_ref::<ApiError>() {
-            Some(answer) => refused(answer.status(), answer.body()),
-            None => error,
+        .map_err(|error| {
+            let sentence = error.downcast_ref::<ApiError>().map(refused);
+            match sentence {
+                Some(sentence) => error.context(sentence),
+                None => error,
+            }
         })
 }
 
@@ -425,8 +431,8 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
                 Some(v) => cloud.join(&format!("/asset-delivery-api/v1/assetId/{id}/version/{v}")),
                 None => cloud.join(&format!("/asset-delivery-api/v1/assetId/{id}")),
             };
-            let resp = get(ctx, &url, Some(("x-api-key", key)), |status, body| {
-                anyhow!("asset-delivery {status}: {body}")
+            let resp = get(ctx, &url, Some(("x-api-key", key)), |_| {
+                "the asset-delivery lookup failed".to_string()
             })
             .await?;
             let meta: serde_json::Value = resp.json().await?;
@@ -436,8 +442,8 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
                 .context("no download location in asset-delivery response")?;
             // No key: the location carries its own authorisation, and is a
             // host this code did not choose.
-            let dl = get(ctx, location, None, |status, _| {
-                anyhow!("CDN returned {status}")
+            let dl = get(ctx, location, None, |_| {
+                "the CDN download failed".to_string()
             })
             .await?;
             Ok(dl.bytes().await?.to_vec())
@@ -445,12 +451,9 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
         Source::Public => {
             let delivery = &ctx.hosts.delivery;
             let url = delivery.join(&format!("/v1/asset/?id={id}"));
-            let resp = get(ctx, &url, cookie(ctx), |status, body| {
-                anyhow!(
-                    "{}",
-                    public_refusal(body.as_bytes())
-                        .unwrap_or_else(|| format!("assetdelivery returned {status}"))
-                )
+            let resp = get(ctx, &url, cookie(ctx), |answer| {
+                public_refusal(answer.body().as_bytes())
+                    .unwrap_or_else(|| "assetdelivery refused the download".to_string())
             })
             .await?;
             let is_json = resp
@@ -496,8 +499,8 @@ fn cookie(ctx: &Ctx) -> Option<(&str, &str)> {
 async fn fetch_details(ctx: &Ctx, id: u64) -> Result<(Option<String>, Option<i64>)> {
     let economy = &ctx.hosts.economy;
     let url = economy.join(&format!("/v2/assets/{id}/details"));
-    let resp = get(ctx, &url, cookie(ctx), |status, _| {
-        anyhow!("economy details {status} (tip: pass --type to skip this lookup)")
+    let resp = get(ctx, &url, cookie(ctx), |_| {
+        "the economy details lookup failed (tip: pass --type to skip it)".to_string()
     })
     .await?;
     let v: serde_json::Value = resp.json().await?;
@@ -1075,8 +1078,27 @@ mod tests {
         let error = download_bytes(&ctx(&server, Source::Public, None), 42, None)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("404"), "got: {error}");
+        assert!(format!("{error:#}").contains("404"), "got: {error:#}");
         assert_eq!(requests_for(&server, "/v1/asset/").await.len(), 1);
+    }
+
+    /// A rate limit too long to wait out is reported with how long it is,
+    /// under the endpoint's own sentence rather than replaced by it.
+    #[tokio::test]
+    async fn a_rate_limit_too_long_to_wait_says_how_long() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/asset/"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "300"))
+            .mount(&server)
+            .await;
+
+        let error = download_bytes(&ctx(&server, Source::Public, None), 42, None)
+            .await
+            .unwrap_err();
+        let shown = format!("{error:#}");
+        assert!(shown.contains("assetdelivery refused"), "got: {shown}");
+        assert!(shown.contains("reopens in 300s"), "got: {shown}");
     }
 
     /// A server whose first connection hears the request and never answers,
@@ -1251,7 +1273,13 @@ mod tests {
         let error = download_bytes(&ctx(&server, Source::Cloud, Some("k")), 42, None)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("403"), "got: {error}");
+        let shown = format!("{error:#}");
+        assert!(
+            shown.contains("asset-delivery lookup failed"),
+            "got: {shown}"
+        );
+        assert!(shown.contains("403"), "got: {shown}");
+        assert!(shown.contains("denied"), "got: {shown}");
     }
 
     /// The public endpoint takes the id as a query parameter, unlike the cloud
