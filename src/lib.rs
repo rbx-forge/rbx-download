@@ -792,11 +792,45 @@ impl PartFile {
 ///
 /// `Unsupported` where the platform says so. Windows answers a volume without
 /// hard links with `ERROR_INVALID_FUNCTION` (1) or `ERROR_NOT_SUPPORTED` (50),
-/// which std does not map to `Unsupported`. Those numbers mean other things
-/// elsewhere (1 is `EPERM` on Unix), hence the platform check.
+/// and Linux answers `link(2)` on FAT or exFAT with `EPERM` (1), which std
+/// maps to `PermissionDenied`. None of those is `Unsupported`, and the numbers
+/// mean other things on the other platform, hence the platform checks.
+///
+/// `EPERM` can also be a real permission problem. The rename that follows then
+/// fails on it too, so taking it for "no hard links" loses nothing. `EACCES`
+/// stays an error.
 fn hard_links_unsupported(error: &std::io::Error) -> bool {
+    links_unsupported_on(Platform::current(), error)
+}
+
+/// The platform whose error numbers an error carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Platform {
+    Windows,
+    Unix,
+    Other,
+}
+
+impl Platform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(unix) {
+            Self::Unix
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// [`hard_links_unsupported`] for a given platform, so every platform's
+/// answer is tested on whichever one the tests run on.
+fn links_unsupported_on(platform: Platform, error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::Unsupported
-        || (cfg!(windows) && matches!(error.raw_os_error(), Some(1 | 50)))
+        || matches!(
+            (platform, error.raw_os_error()),
+            (Platform::Windows, Some(1 | 50)) | (Platform::Unix, Some(1))
+        )
 }
 
 impl Drop for PartFile {
@@ -1189,22 +1223,35 @@ mod tests {
         use std::io::{Error, ErrorKind};
 
         assert!(hard_links_unsupported(&Error::from(ErrorKind::Unsupported)));
-        assert!(!hard_links_unsupported(&Error::from(
-            ErrorKind::PermissionDenied
-        )));
         assert!(!hard_links_unsupported(&Error::from(ErrorKind::NotFound)));
+        // ERROR_INVALID_FUNCTION on Windows, EPERM on Unix: both what a
+        // volume without hard links answers.
+        assert!(hard_links_unsupported(&Error::from_raw_os_error(1)));
+    }
+
+    #[test]
+    fn on_windows_a_denied_access_does_not_fall_back() {
+        use std::io::{Error, ErrorKind};
+
+        let windows = |e: &Error| links_unsupported_on(Platform::Windows, e);
+        assert!(windows(&Error::from_raw_os_error(1)));
+        assert!(windows(&Error::from_raw_os_error(50)));
+        assert!(!windows(&Error::from(ErrorKind::PermissionDenied)));
         // ERROR_SHARING_VIOLATION and ERROR_ACCESS_DENIED.
-        assert!(!hard_links_unsupported(&Error::from_raw_os_error(32)));
-        assert!(!hard_links_unsupported(&Error::from_raw_os_error(5)));
-        // ERROR_INVALID_FUNCTION and ERROR_NOT_SUPPORTED on Windows; EPERM
-        // and a socket error elsewhere.
-        for code in [1, 50] {
-            assert_eq!(
-                hard_links_unsupported(&Error::from_raw_os_error(code)),
-                cfg!(windows),
-                "os error {code}"
-            );
-        }
+        assert!(!windows(&Error::from_raw_os_error(32)));
+        assert!(!windows(&Error::from_raw_os_error(5)));
+    }
+
+    /// Linux answers `link(2)` on FAT or exFAT with EPERM, which std calls
+    /// `PermissionDenied`. EACCES is still a permission problem.
+    #[test]
+    fn on_unix_eperm_falls_back_and_eacces_does_not() {
+        use std::io::Error;
+
+        let unix = |e: &Error| links_unsupported_on(Platform::Unix, e);
+        assert!(unix(&Error::from_raw_os_error(1)));
+        assert!(!unix(&Error::from_raw_os_error(13)));
+        assert!(!unix(&Error::from_raw_os_error(50)));
     }
 
     /// A link found at the part's name is replaced, not written through: the
