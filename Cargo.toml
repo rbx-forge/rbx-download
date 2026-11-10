@@ -30,10 +30,10 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 colored = "2"
-# Same major as `rbx-core`, so the `reqwest::Client` it builds is the type this
-# crate sends requests with. TLS is whatever `rbx-core` selects, which is
-# rustls over the OS trust store: no OpenSSL to find at launch.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# Same major as `rbx-core`, so a `reqwest` type passed between the two crates is
+# one type and not two of the same name. TLS is whatever `rbx-core` selects, which
+# is rustls over the OS trust store: no OpenSSL to find at launch.
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # The HTTP client, the host constants, the filename sanitiser and the Studio

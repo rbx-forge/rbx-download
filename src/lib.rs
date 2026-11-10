@@ -16,6 +16,7 @@
 //! no economy lookup happens at all.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -143,7 +144,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     // Auth per backend. The cookie goes through the one resolution chain, so
     // the consent prompt, the refusals and the stderr notice are the shared
     // ones rather than a second copy of them.
-    let client = rbx_core::api::build_client();
+    let client = http_client(CONNECT_TIMEOUT, READ_TIMEOUT)?;
     let cookie_header = match source {
         Source::Public => rbx_core::env::resolve_cookie(
             cli.cookie.as_deref(),
@@ -268,6 +269,28 @@ impl Default for Hosts {
 
 const DELIVERY_HOST: &str = "https://assetdelivery.roblox.com";
 const ECONOMY_HOST: &str = "https://economy.roblox.com";
+
+/// How long opening a connection may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the server may go without sending anything, waiting for the
+/// response or in the middle of its body.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The client every request goes through.
+///
+/// No total timeout: one would cap the whole transfer, body included, and cut
+/// a large place on a slow link off while its bytes are still arriving. A
+/// connect timeout and a read timeout catch a dead server and a stalled one,
+/// and leave a slow download alone for as long as it keeps moving.
+fn http_client(connect: Duration, read: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .gzip(true)
+        .connect_timeout(connect)
+        .read_timeout(read)
+        .build()
+        .context("building the HTTP client")
+}
 
 struct Ctx {
     client: reqwest::Client,
@@ -577,7 +600,7 @@ mod tests {
     /// the code asks for.
     fn ctx(server: &MockServer, source: Source, api_key: Option<&str>) -> Ctx {
         Ctx {
-            client: reqwest::Client::new(),
+            client: http_client(CONNECT_TIMEOUT, READ_TIMEOUT).unwrap(),
             hosts: Hosts {
                 cloud: ApiBase::new(server.uri()),
                 delivery: ApiBase::new(server.uri()),
@@ -659,6 +682,90 @@ mod tests {
 
         download_all(&ctx, &[42]).await.unwrap();
         assert_eq!(std::fs::read(dir.path().join("42.rbxm")).unwrap(), b"v2");
+    }
+
+    /// A server that answers one request with `body`, sent in `pieces` parts
+    /// with `gap` before each. Raw TCP because the mock server sends a body in
+    /// one go, and a timeout on the body needs one that arrives slowly.
+    fn trickling_server(body: &'static [u8], pieces: usize, gap: Duration) -> String {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.flush();
+            // Write errors are the client giving up, which is what some tests
+            // are waiting for.
+            for piece in body.chunks(body.len().div_ceil(pieces)) {
+                std::thread::sleep(gap);
+                if stream
+                    .write_all(piece)
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn ctx_against(base: &str, read_timeout: Duration) -> Ctx {
+        Ctx {
+            client: http_client(CONNECT_TIMEOUT, read_timeout).unwrap(),
+            hosts: Hosts {
+                cloud: ApiBase::new(base),
+                delivery: ApiBase::new(base),
+                economy: ApiBase::new(base),
+            },
+            cookie_header: None,
+            api_key: None,
+            source: Source::Public,
+            output: PathBuf::from("."),
+            version: None,
+            raw: false,
+            force: false,
+            forced: None,
+        }
+    }
+
+    /// A body that keeps arriving is not a timeout however long it takes in
+    /// all. With a total timeout equal to the read timeout, this download
+    /// fails halfway.
+    #[tokio::test]
+    async fn a_slow_body_that_keeps_arriving_is_not_cut_off() {
+        let base = trickling_server(b"0123456789", 5, Duration::from_millis(150));
+        let ctx = ctx_against(&base, Duration::from_millis(500));
+
+        let bytes = download_bytes(&ctx, 42, None).await.unwrap();
+        assert_eq!(bytes, b"0123456789");
+    }
+
+    /// A body that stops arriving is.
+    #[tokio::test]
+    async fn a_body_that_stalls_is_cut_off() {
+        let base = trickling_server(b"0123456789", 1, Duration::from_secs(3));
+        let ctx = ctx_against(&base, Duration::from_millis(300));
+
+        let started = std::time::Instant::now();
+        assert!(download_bytes(&ctx, 42, None).await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     /// clap checks a command's definition only when it is built, and a clash

@@ -92,6 +92,10 @@ The filename does not carry the asset version, so two versions of one asset shar
 - with the same bytes, it is left alone and reported as `already there`;
 - with different bytes, that asset is refused with the file's path, the other ids still download, and the run exits non-zero. `--force` overwrites it instead.
 
+## Network
+
+A connection gets 30 seconds to open, and the server 60 seconds of silence before the request is given up. There is no cap on the transfer as a whole, so a large asset on a slow link takes as long as it takes while its bytes keep arriving.
+
 ## License
 
 [MPL-2.0](LICENSE)
