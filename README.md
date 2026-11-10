@@ -98,7 +98,7 @@ A connection gets 30 seconds to open, and the server 60 seconds of silence befor
 
 A request that meets a rate limit (429), a server error (5xx), a timeout or a failed connection is sent again, up to three more times, waiting 1, 2 and then 4 seconds, or as long as a rate limit says. A rate limit that asks for more than two minutes is reported rather than waited out. Every request is a download that changes nothing, so sending it twice is safe. A body that breaks off halfway is not retried: that asset fails and the others go on.
 
-The API key and the cookie go only to the host they were given for. Asset delivery redirects to a CDN, and every hop that leaves that host is followed without them, including a later hop back to it.
+The API key and the cookie go only to the host they were given for. Asset delivery redirects to a CDN, and every hop that leaves that host is followed without them, including a later hop back to it. An error never prints the URL it was requesting, since a CDN location is a signed download link.
 
 ## License
 
