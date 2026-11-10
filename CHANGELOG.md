@@ -4,14 +4,14 @@
 
 ### Fixed
 
-- An ids file takes the comments its help promised: `#` starts a comment that runs to the end of the line, on a line of its own or after an id. A comment with words in it used to fail on its first word. An id that does not parse is reported with its line number.
-- A download no longer writes over a file that is already there. The same bytes are left alone and reported as `already there`; different bytes, such as another version of the same asset under the same name, refuse that asset with the file's path, and the run exits non-zero once the other ids are done. `--force` overwrites.
-- A large asset on a slow link is no longer cut off after a minute. The one-minute cap covered the whole transfer, body included; it is now a 30 second connect timeout and a 60 second read timeout, which fire on a server that does not answer or stops sending, not on a download that is still moving.
-- A rate limit, a server error, a timeout or a failed connection no longer fails an asset on the first try. Each request is sent again up to three times with backoff, waiting as long as a rate limit asks for.
+- An ids file takes the comments its help describes: `#` starts a comment that runs to the end of the line, on a line of its own or after an id, words and all. An id that does not parse is reported with its line number.
+- A download does not write over a file that is already there. The same bytes are left alone and reported as `already there`. Different bytes, such as another version of the same asset under the same name, refuse that asset with the file's path, and the run exits non-zero once the other ids are done. `--force` overwrites.
+- A large asset on a slow link is not cut off while its bytes keep arriving: a connection gets 30 seconds to open and the server 60 seconds of silence, with no cap on the transfer as a whole.
+- A rate limit, a server error, a timeout or a failed connection does not fail an asset on the first try. The request is sent again up to three times with backoff, or after as long as a rate limit asks for.
 
 ### Security
 
-- The API key no longer follows a redirect to another host. Redirects were followed with every header but `Cookie` and `Authorization`, so a redirect from the Open Cloud host sent `x-api-key` on to wherever it pointed. Redirects are now followed one hop at a time, and the key and the cookie go along only while every hop stays on the host they were given for.
+- The API key and the cookie go only to the host they were given for. Redirects are followed one hop at a time, and the credential goes along only while every hop stays on that host, so a redirect to a CDN or anywhere else is followed without it.
 - Release archives carry a build provenance attestation: `gh attestation verify <zip> --repo rbx-forge/rbx-download`. The build jobs run with read access only, and the publishing job alone may write.
 
 ## [0.1.0] - 2026-11-08
