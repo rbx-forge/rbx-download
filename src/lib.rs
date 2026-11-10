@@ -338,12 +338,19 @@ async fn get(
 /// it instead. The credential goes with a hop only while every hop so far has
 /// stayed on the origin it was given for (scheme, host and port), and once
 /// dropped it stays dropped.
+///
+/// A reqwest error carries the full URL of its request, and every error ends
+/// up printed. A CDN location is signed, a download link anyone holding it can
+/// use, so the URL comes off every error here, on the first hop as well, which
+/// needs it least. Body reads strip it too: reqwest 0.12 puts no URL on a body
+/// error, and that is its choice to change, not a promise.
 async fn follow(
     ctx: &Ctx,
     url: &str,
     credential: Option<(&str, &str)>,
 ) -> Result<reqwest::Response> {
-    let mut url = reqwest::Url::parse(url).with_context(|| format!("invalid URL {url}"))?;
+    // Not `{url}` in the message: a download location is a signed URL.
+    let mut url = reqwest::Url::parse(url).context("the address to download from is not a URL")?;
     let origin = url.origin();
     let mut credential = credential;
     for _ in 0..=MAX_REDIRECTS {
@@ -351,7 +358,7 @@ async fn follow(
         if let Some((name, value)) = credential {
             request = request.header(name, value);
         }
-        let response = request.send().await?;
+        let response = request.send().await.map_err(reqwest::Error::without_url)?;
         if !response.status().is_redirection() {
             return Ok(response);
         }
@@ -435,7 +442,7 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
                 "the asset-delivery lookup failed".to_string()
             })
             .await?;
-            let meta: serde_json::Value = resp.json().await?;
+            let meta: serde_json::Value = resp.json().await.map_err(reqwest::Error::without_url)?;
             let location = meta
                 .get("location")
                 .and_then(|v| v.as_str())
@@ -446,7 +453,11 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
                 "the CDN download failed".to_string()
             })
             .await?;
-            Ok(dl.bytes().await?.to_vec())
+            Ok(dl
+                .bytes()
+                .await
+                .map_err(reqwest::Error::without_url)?
+                .to_vec())
         }
         Source::Public => {
             let delivery = &ctx.hosts.delivery;
@@ -462,7 +473,8 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.contains("application/json"))
                 .unwrap_or(false);
-            let bytes = resp.bytes().await?;
+            // After a redirect, the response's URL is the signed CDN one.
+            let bytes = resp.bytes().await.map_err(reqwest::Error::without_url)?;
             if is_json {
                 // Body is an error payload, not the asset.
                 bail!(
@@ -503,7 +515,7 @@ async fn fetch_details(ctx: &Ctx, id: u64) -> Result<(Option<String>, Option<i64
         "the economy details lookup failed (tip: pass --type to skip it)".to_string()
     })
     .await?;
-    let v: serde_json::Value = resp.json().await?;
+    let v: serde_json::Value = resp.json().await.map_err(reqwest::Error::without_url)?;
     let name = v.get("Name").and_then(|n| n.as_str()).map(str::to_string);
     let type_id = v.get("AssetTypeId").and_then(|t| t.as_i64());
     Ok((name, type_id))
@@ -1128,6 +1140,64 @@ mod tests {
             }
         });
         format!("http://{address}")
+    }
+
+    /// A server that accepts every connection and closes it unanswered.
+    fn server_that_hangs_up() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// The signature that makes a CDN location a working download link.
+    const SIGNATURE: &str = "sig=aaaaBBBBccccDDDD";
+
+    /// The CDN location is a signed link, and a failed request to it is
+    /// printed with its whole chain: the link must not be in it.
+    #[tokio::test]
+    async fn a_failed_cdn_request_does_not_print_its_signed_url() {
+        let api = MockServer::start().await;
+        let cdn = server_that_hangs_up();
+        Mock::given(method("GET"))
+            .and(path("/asset-delivery-api/v1/assetId/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "location": format!("{cdn}/blob?{SIGNATURE}")
+            })))
+            .mount(&api)
+            .await;
+
+        let error = download_bytes(&ctx(&api, Source::Cloud, Some("k")), 42, None)
+            .await
+            .unwrap_err();
+        let shown = format!("{error:?}");
+        assert!(!shown.contains(SIGNATURE), "got: {shown}");
+    }
+
+    /// The same for a body that breaks off after a redirect, where the
+    /// response's own URL is the signed one. reqwest 0.12 leaves the URL off
+    /// a body error by itself; this holds that whatever reqwest does.
+    #[tokio::test]
+    async fn a_body_that_breaks_off_after_a_redirect_does_not_print_its_signed_url() {
+        let delivery = MockServer::start().await;
+        let cdn = trickling_server(b"0123456789", 1, Duration::from_secs(3));
+        Mock::given(method("GET"))
+            .and(path("/v1/asset/"))
+            .respond_with(redirect_to(format!("{cdn}/blob?{SIGNATURE}")))
+            .mount(&delivery)
+            .await;
+        let ctx = Ctx {
+            client: http_client(CONNECT_TIMEOUT, Duration::from_millis(300)).unwrap(),
+            ..ctx(&delivery, Source::Public, None)
+        };
+
+        let error = download_bytes(&ctx, 42, None).await.unwrap_err();
+        let shown = format!("{error:?}");
+        assert!(!shown.contains(SIGNATURE), "got: {shown}");
     }
 
     /// A request that times out waiting for its answer is sent again.
