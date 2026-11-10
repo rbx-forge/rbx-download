@@ -681,12 +681,17 @@ mod tests {
     /// Every host on one server: a test wants one place answering whatever
     /// the code asks for.
     fn ctx(server: &MockServer, source: Source, api_key: Option<&str>) -> Ctx {
+        ctx_at(&server.uri(), source, api_key)
+    }
+
+    /// [`ctx`] against any address, for the servers that are not mocks.
+    fn ctx_at(base: &str, source: Source, api_key: Option<&str>) -> Ctx {
         Ctx {
             client: http_client(CONNECT_TIMEOUT, READ_TIMEOUT).unwrap(),
             hosts: Hosts {
-                cloud: ApiBase::new(server.uri()),
-                delivery: ApiBase::new(server.uri()),
-                economy: ApiBase::new(server.uri()),
+                cloud: ApiBase::new(base),
+                delivery: ApiBase::new(base),
+                economy: ApiBase::new(base),
             },
             cookie_header: None,
             api_key: api_key.map(str::to_string),
@@ -818,20 +823,7 @@ mod tests {
     fn ctx_against(base: &str, read_timeout: Duration) -> Ctx {
         Ctx {
             client: http_client(CONNECT_TIMEOUT, read_timeout).unwrap(),
-            hosts: Hosts {
-                cloud: ApiBase::new(base),
-                delivery: ApiBase::new(base),
-                economy: ApiBase::new(base),
-            },
-            cookie_header: None,
-            api_key: None,
-            source: Source::Public,
-            output: PathBuf::from("."),
-            version: None,
-            raw: false,
-            force: false,
-            forced: None,
-            retry: NO_WAIT,
+            ..ctx_at(base, Source::Public, None)
         }
     }
 
