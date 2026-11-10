@@ -96,6 +96,8 @@ The filename does not carry the asset version, so two versions of one asset shar
 
 A connection gets 30 seconds to open, and the server 60 seconds of silence before the request is given up. There is no cap on the transfer as a whole, so a large asset on a slow link takes as long as it takes while its bytes keep arriving.
 
+The API key and the cookie go only to the host they were given for. Asset delivery redirects to a CDN, and every hop that leaves that host is followed without them, including a later hop back to it.
+
 ## License
 
 [MPL-2.0](LICENSE)
