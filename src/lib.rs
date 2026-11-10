@@ -814,22 +814,18 @@ const STALE_PART_AGE: Duration = Duration::from_secs(60);
 
 /// Remove the part files a killed run left in `dir`, older than `age`.
 ///
-/// Only names of the shape [`PartFile`] makes, `.<name>.<digits>.part`, so a
-/// file of the user's that happens to end in `.part` is left alone.
+/// Only names [`is_our_part_name`] recognises, so another tool's partial
+/// download in the same directory, or a file of the user's that happens to
+/// end in `.part`, is left alone. The name is checked first, and only a name
+/// of ours costs a metadata read.
 fn sweep_stale_parts(dir: &std::path::Path, age: Duration) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let is_part = name
-            .strip_prefix('.')
-            .and_then(|rest| rest.strip_suffix(".part"))
-            .and_then(|rest| rest.rsplit_once('.'))
-            .is_some_and(|(stem, pid)| {
-                !stem.is_empty() && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
-            });
+        if !entry.file_name().to_str().is_some_and(is_our_part_name) {
+            continue;
+        }
         let is_stale = entry
             .metadata()
             .ok()
@@ -837,10 +833,30 @@ fn sweep_stale_parts(dir: &std::path::Path, age: Duration) {
             .and_then(|meta| meta.modified().ok())
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|elapsed| elapsed > age);
-        if is_part && is_stale {
+        if is_stale {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// Whether `name` is a part file this tool makes: `.<asset file>.<pid>.part`,
+/// where the asset file is named as [`save`] names it, `<id>_<name>.<ext>` or
+/// `<id>.<ext>`.
+fn is_our_part_name(name: &str) -> bool {
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let Some((asset_file, pid)) = name
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".part"))
+        .and_then(|rest| rest.rsplit_once('.'))
+    else {
+        return false;
+    };
+    let id_len = asset_file.bytes().take_while(u8::is_ascii_digit).count();
+    let after_id = &asset_file[id_len..];
+    all_digits(pid)
+        && id_len > 0
+        && (after_id.starts_with('_') || after_id.starts_with('.'))
+        && after_id.len() > 1
 }
 
 /// Whether the file at `path` holds exactly `bytes`.
@@ -1240,18 +1256,41 @@ mod tests {
         make(".notes.part", old);
         make("draft.1234.part", old);
         make(".44.rbxm.12a4.part", old);
+        make(".42_A Hat.rbxm.1234.part", old);
+        // Another tool's partial downloads, of the same general shape.
+        make(".video.mp4.1234.part", old);
+        make(".42abc.bin.1234.part", old);
 
         sweep_stale_parts(dir.path(), STALE_PART_AGE);
 
         assert_eq!(
             names_in(dir.path()),
             [
+                ".42abc.bin.1234.part",
                 ".43.rbxm.1234.part",
                 ".44.rbxm.12a4.part",
                 ".notes.part",
+                ".video.mp4.1234.part",
                 "draft.1234.part"
             ]
         );
+    }
+
+    #[test]
+    fn a_part_name_of_ours_follows_the_asset_naming() {
+        for ours in [".42.rbxm.1234.part", ".42_A Hat.rbxm.1234.part"] {
+            assert!(is_our_part_name(ours), "{ours}");
+        }
+        for theirs in [
+            ".video.mp4.1234.part",
+            ".42abc.bin.1234.part",
+            ".42.1234.part",
+            ".42..1234.part",
+            ".42.rbxm.part",
+            "42.rbxm.1234.part",
+        ] {
+            assert!(!is_our_part_name(theirs), "{theirs}");
+        }
     }
 
     /// A server that answers one request with `body`, sent in `pieces` parts
