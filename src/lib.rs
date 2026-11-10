@@ -70,6 +70,14 @@ pub struct Cli {
     #[arg(long)]
     pub raw: bool,
 
+    /// Overwrite a file that is already there with different bytes.
+    ///
+    /// Without it such an asset is refused and the run exits non-zero: the
+    /// filename does not carry the asset version, so the file on disk may be
+    /// another version of the same asset.
+    #[arg(long)]
+    pub force: bool,
+
     /// Open Cloud API key. Selects the cloud backend.
     // `hide_env_values` is not cosmetic: without it clap prints
     // `[env: RBX_API_KEY=<the actual key>]` in `--help`, so a key leaks into any
@@ -165,17 +173,40 @@ pub async fn run(cli: Cli) -> Result<()> {
         output: cli.output,
         version: cli.asset_version,
         raw: cli.raw,
+        force: cli.force,
         forced,
     };
 
+    download_all(&ctx, &ids).await
+}
+
+/// Each id in turn, one line apiece. One that fails or is refused does not
+/// stop the others; the run fails at the end if any did.
+async fn download_all(ctx: &Ctx, ids: &[u64]) -> Result<()> {
     println!("Downloading {} asset(s) via {:?}...", ids.len(), ctx.source);
     let mut ok = 0usize;
+    let mut already_there = 0usize;
+    let mut refused = 0usize;
     let mut failed = 0usize;
-    for id in ids {
-        match download_one(&ctx, id).await {
-            Ok(name) => {
+    for &id in ids {
+        match download_one(ctx, id).await {
+            Ok(Saved::Written(name)) => {
                 println!("  {} {}", "✓".green(), name);
                 ok += 1;
+            }
+            Ok(Saved::AlreadyThere(name)) => {
+                println!("  {} {} (already there)", "=".green(), name);
+                already_there += 1;
+            }
+            Ok(Saved::Refused(path)) => {
+                println!(
+                    "  {} asset {}: {} is already there with different bytes \
+                     (--force overwrites it)",
+                    "✗".red(),
+                    id,
+                    path.display()
+                );
+                refused += 1;
             }
             Err(e) => {
                 println!("  {} asset {}: {}", "✗".red(), id, e);
@@ -184,11 +215,33 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    println!("\n{} {} ok, {} failed", "Done:".bold(), ok, failed);
-    if failed > 0 {
-        bail!("{} download(s) failed", failed);
+    let mut summary = format!("{ok} ok");
+    if already_there > 0 {
+        summary.push_str(&format!(", {already_there} already there"));
     }
-    Ok(())
+    if refused > 0 {
+        summary.push_str(&format!(", {refused} refused"));
+    }
+    summary.push_str(&format!(", {failed} failed"));
+    println!("\n{} {}", "Done:".bold(), summary);
+
+    match (failed, refused) {
+        (0, 0) => Ok(()),
+        (0, r) => bail!("{r} asset(s) refused: a different file is already there"),
+        (f, 0) => bail!("{f} download(s) failed"),
+        (f, r) => bail!("{f} download(s) failed, {r} refused"),
+    }
+}
+
+/// What became of an asset's bytes on disk.
+#[derive(Debug, PartialEq, Eq)]
+enum Saved {
+    /// Written to a new file, or over a different one under `--force`.
+    Written(String),
+    /// The file was already there with these same bytes, and is left alone.
+    AlreadyThere(String),
+    /// A file with different bytes is in the way and `--force` was not given.
+    Refused(PathBuf),
 }
 
 /// The three hosts this tool reaches, one field each.
@@ -225,11 +278,13 @@ struct Ctx {
     output: PathBuf,
     version: Option<u64>,
     raw: bool,
+    /// `--force`: overwrite a file that is there with different bytes.
+    force: bool,
     /// `(extension, type_id)` from --type, when given.
     forced: Option<(String, Option<i64>)>,
 }
 
-async fn download_one(ctx: &Ctx, id: u64) -> Result<String> {
+async fn download_one(ctx: &Ctx, id: u64) -> Result<Saved> {
     // Determine name + extension + type id, fetching economy metadata only if
     // --type wasn't supplied.
     let (name, ext, type_id) = match &ctx.forced {
@@ -346,14 +401,53 @@ async fn fetch_details(ctx: &Ctx, id: u64) -> Result<(Option<String>, Option<i64
     Ok((name, type_id))
 }
 
-fn save(ctx: &Ctx, id: u64, name: &Option<String>, ext: &str, bytes: &[u8]) -> Result<String> {
+/// Write the bytes under the asset's filename, unless something is in the way.
+///
+/// The filename does not carry the asset version, so a file already there may
+/// be another version of the same asset, or a file the user edited. The same
+/// bytes are left alone; different ones are refused unless `--force`.
+fn save(ctx: &Ctx, id: u64, name: &Option<String>, ext: &str, bytes: &[u8]) -> Result<Saved> {
     let filename = match name.as_deref().map(rbx_core::fs_name::safe_component) {
         Some(safe) if !safe.is_empty() => format!("{id}_{safe}.{ext}"),
         _ => format!("{id}.{ext}"),
     };
     let path = ctx.output.join(&filename);
-    std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
-    Ok(filename)
+    let writing = || format!("writing {}", path.display());
+
+    if ctx.force {
+        std::fs::write(&path, bytes).with_context(writing)?;
+        return Ok(Saved::Written(filename));
+    }
+
+    // `create_new` rather than a check followed by a write, so a file that
+    // appears in between is not overwritten either.
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path);
+    match created {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            if let Err(e) = file.write_all(bytes) {
+                // A half-written file would be refused as "different" by the
+                // next run, so it goes rather than stays.
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+                return Err(e).with_context(writing);
+            }
+            Ok(Saved::Written(filename))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            if existing == bytes {
+                Ok(Saved::AlreadyThere(filename))
+            } else {
+                Ok(Saved::Refused(path))
+            }
+        }
+        Err(e) => Err(e).with_context(writing),
+    }
 }
 
 fn read_ids_file(path: &PathBuf) -> Result<Vec<u64>> {
@@ -495,8 +589,76 @@ mod tests {
             output: PathBuf::from("."),
             version: None,
             raw: false,
+            force: false,
             forced: None,
         }
+    }
+
+    /// An output directory of its own, and a `--type` so no economy lookup
+    /// is needed: what a test of the files on disk wants.
+    fn ctx_writing_to(server: &MockServer, dir: &tempfile::TempDir) -> Ctx {
+        Ctx {
+            output: dir.path().to_path_buf(),
+            forced: Some(("rbxm".to_string(), None)),
+            ..ctx(server, Source::Public, None)
+        }
+    }
+
+    async fn serve_public(server: &MockServer, id: u64, body: &[u8]) {
+        Mock::given(method("GET"))
+            .and(path("/v1/asset/"))
+            .and(query_param("id", id.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(server)
+            .await;
+    }
+
+    /// The same bytes twice is not a conflict: the second run says so and
+    /// leaves the file alone.
+    #[tokio::test]
+    async fn the_same_bytes_already_on_disk_are_left_alone() {
+        let server = MockServer::start().await;
+        serve_public(&server, 42, b"v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("42.rbxm"), b"v1").unwrap();
+
+        let saved = download_one(&ctx_writing_to(&server, &dir), 42)
+            .await
+            .unwrap();
+        assert_eq!(saved, Saved::AlreadyThere("42.rbxm".to_string()));
+    }
+
+    /// The filename carries no version, so another version of the asset has
+    /// the same name. It is refused, the file keeps its bytes, the other ids
+    /// still download, and the run fails at the end.
+    #[tokio::test]
+    async fn different_bytes_on_disk_are_refused_and_the_others_still_download() {
+        let server = MockServer::start().await;
+        serve_public(&server, 42, b"v2").await;
+        serve_public(&server, 43, b"new").await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("42.rbxm"), b"v1").unwrap();
+
+        let result = download_all(&ctx_writing_to(&server, &dir), &[42, 43]).await;
+
+        assert!(result.is_err(), "a refused asset fails the run");
+        assert_eq!(std::fs::read(dir.path().join("42.rbxm")).unwrap(), b"v1");
+        assert_eq!(std::fs::read(dir.path().join("43.rbxm")).unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn force_overwrites_different_bytes() {
+        let server = MockServer::start().await;
+        serve_public(&server, 42, b"v2").await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("42.rbxm"), b"v1").unwrap();
+        let ctx = Ctx {
+            force: true,
+            ..ctx_writing_to(&server, &dir)
+        };
+
+        download_all(&ctx, &[42]).await.unwrap();
+        assert_eq!(std::fs::read(dir.path().join("42.rbxm")).unwrap(), b"v2");
     }
 
     /// clap checks a command's definition only when it is built, and a clash
