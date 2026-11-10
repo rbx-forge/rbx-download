@@ -58,6 +58,7 @@ With several ids, each one is attempted and reported on its own line. One that f
 - `--type <id|alias>`: skip the economy metadata lookup by giving the asset type yourself. Aliases: `image`, `audio`, `mesh`, `lua`, `place`, `model`, `animation`, `video`, `font`
 - `--asset-version <n>`: pin a specific asset version (Open Cloud only; requires an API key and exactly one id)
 - `--raw`: don't dereference Animation wrappers to their KeyframeSequence
+- `--force`: overwrite a file that is already there with different bytes (see [Filenames](#filenames))
 - `--api-key <key>`, `-a`: Open Cloud API key, or `RBX_API_KEY`
 - `--cookie <value>`: `.ROBLOSECURITY` cookie for the public backend, or `RBX_COOKIE`
 - `--auto-cookie` / `--no-auto-cookie`: use a signed-in Studio's session without asking, or never look for one
@@ -85,6 +86,11 @@ When the Studio session is used, a line on stderr says so. The cookie is sent to
 ## Filenames
 
 Files are saved as `<id>_<sanitized name>.<ext>` (or `<id>.<ext>` when the name is unavailable). The extension comes from the asset's `AssetTypeId` via the economy details endpoint, unless `--type` was given, in which case no metadata lookup happens at all. A type nobody has measured is saved as `.bin` rather than under a plausible guess.
+
+The filename does not carry the asset version, so two versions of one asset share a name. When the file is already there:
+
+- with the same bytes, it is left alone and reported as `already there`;
+- with different bytes, that asset is refused with the file's path, the other ids still download, and the run exits non-zero. `--force` overwrites it instead.
 
 ## License
 

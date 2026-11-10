@@ -42,6 +42,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 rbx-core = { git = "https://github.com/rbx-forge/rbx-core", tag = "v0.1.1" }
 
 [dev-dependencies]
+tempfile = "3"
 wiremock = "0.6"
 
 [profile.release]
