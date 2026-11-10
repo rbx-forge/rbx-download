@@ -283,13 +283,62 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// a large place on a slow link off while its bytes are still arriving. A
 /// connect timeout and a read timeout catch a dead server and a stalled one,
 /// and leave a slow download alone for as long as it keeps moving.
+///
+/// It follows no redirect itself: [`get`] does, and decides at each hop
+/// whether the credential goes along.
 fn http_client(connect: Duration, read: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .gzip(true)
         .connect_timeout(connect)
         .read_timeout(read)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building the HTTP client")
+}
+
+/// As many redirects as one request may follow: reqwest's own default.
+const MAX_REDIRECTS: usize = 10;
+
+/// GET `url`, with a credential header if one is given, following redirects.
+///
+/// The delivery endpoints redirect to a CDN. reqwest drops `Authorization`
+/// and `Cookie` when a redirect leaves the host, but forwards every other
+/// header, `x-api-key` included, so the client follows nothing and this does
+/// it instead. The credential goes with a hop only while every hop so far has
+/// stayed on the origin it was given for (scheme, host and port), and once
+/// dropped it stays dropped.
+async fn get(ctx: &Ctx, url: &str, credential: Option<(&str, &str)>) -> Result<reqwest::Response> {
+    let mut url = reqwest::Url::parse(url).with_context(|| format!("invalid URL {url}"))?;
+    let origin = url.origin();
+    let mut credential = credential;
+    for _ in 0..=MAX_REDIRECTS {
+        let mut request = ctx.client.get(url.clone());
+        if let Some((name, value)) = credential {
+            request = request.header(name, value);
+        }
+        let response = request.send().await?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+            return Ok(response);
+        };
+        let next = location
+            .to_str()
+            .ok()
+            .and_then(|location| url.join(location).ok())
+            .with_context(|| {
+                format!(
+                    "{} redirected to an unreadable location",
+                    url.host_str().unwrap_or("the server")
+                )
+            })?;
+        if next.origin() != origin {
+            credential = None;
+        }
+        url = next;
+    }
+    bail!("more than {MAX_REDIRECTS} redirects")
 }
 
 struct Ctx {
@@ -345,7 +394,7 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
                 Some(v) => cloud.join(&format!("/asset-delivery-api/v1/assetId/{id}/version/{v}")),
                 None => cloud.join(&format!("/asset-delivery-api/v1/assetId/{id}")),
             };
-            let resp = ctx.client.get(&url).header("x-api-key", key).send().await?;
+            let resp = get(ctx, &url, Some(("x-api-key", key))).await?;
             if !resp.status().is_success() {
                 let s = resp.status();
                 bail!(
@@ -359,7 +408,9 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
                 .get("location")
                 .and_then(|v| v.as_str())
                 .context("no download location in asset-delivery response")?;
-            let dl = ctx.client.get(location).send().await?;
+            // No key: the location carries its own authorisation, and is a
+            // host this code did not choose.
+            let dl = get(ctx, location, None).await?;
             if !dl.status().is_success() {
                 bail!("CDN returned {}", dl.status());
             }
@@ -368,11 +419,7 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
         Source::Public => {
             let delivery = &ctx.hosts.delivery;
             let url = delivery.join(&format!("/v1/asset/?id={id}"));
-            let mut req = ctx.client.get(&url);
-            if let Some(ch) = &ctx.cookie_header {
-                req = req.header(reqwest::header::COOKIE, ch);
-            }
-            let resp = req.send().await?;
+            let resp = get(ctx, &url, cookie(ctx)).await?;
             let status = resp.status();
             let is_json = resp
                 .headers()
@@ -403,15 +450,16 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
     }
 }
 
+/// The `Cookie` header for [`get`], when the run has a session.
+fn cookie(ctx: &Ctx) -> Option<(&str, &str)> {
+    ctx.cookie_header.as_deref().map(|value| ("cookie", value))
+}
+
 /// Fetch `(Name, AssetTypeId)` from the economy details endpoint.
 async fn fetch_details(ctx: &Ctx, id: u64) -> Result<(Option<String>, Option<i64>)> {
     let economy = &ctx.hosts.economy;
     let url = economy.join(&format!("/v2/assets/{id}/details"));
-    let mut req = ctx.client.get(&url);
-    if let Some(ch) = &ctx.cookie_header {
-        req = req.header(reqwest::header::COOKIE, ch);
-    }
-    let resp = req.send().await?;
+    let resp = get(ctx, &url, cookie(ctx)).await?;
     if !resp.status().is_success() {
         bail!(
             "economy details {} (tip: pass --type to skip this lookup)",
@@ -766,6 +814,147 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(download_bytes(&ctx, 42, None).await.is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Every request `server` received for `path`.
+    async fn requests_for(server: &MockServer, path: &str) -> Vec<wiremock::Request> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == path)
+            .collect()
+    }
+
+    fn redirect_to(location: String) -> ResponseTemplate {
+        ResponseTemplate::new(302).insert_header("location", location)
+    }
+
+    /// The key is for the API host. A redirect elsewhere is followed without
+    /// it, and reqwest's own redirect handling would have forwarded it.
+    #[tokio::test]
+    async fn the_api_key_does_not_follow_a_redirect_to_another_host() {
+        let api = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/asset-delivery-api/v1/assetId/42"))
+            .and(header("x-api-key", "k"))
+            .respond_with(redirect_to(format!("{}/moved", elsewhere.uri())))
+            .mount(&api)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/moved"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "location": format!("{}/cdn/blob", elsewhere.uri())
+            })))
+            .mount(&elsewhere)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/cdn/blob"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bytes".to_vec()))
+            .mount(&elsewhere)
+            .await;
+
+        let bytes = download_bytes(&ctx(&api, Source::Cloud, Some("k")), 42, None)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"bytes");
+        for path in ["/moved", "/cdn/blob"] {
+            for request in requests_for(&elsewhere, path).await {
+                assert!(
+                    request.headers.get("x-api-key").is_none(),
+                    "the key reached {path} on another host"
+                );
+            }
+        }
+    }
+
+    /// The public endpoint answers with a redirect to the CDN, and the cookie,
+    /// a whole-account credential, stays behind.
+    #[tokio::test]
+    async fn the_cookie_does_not_follow_a_redirect_to_another_host() {
+        let delivery = MockServer::start().await;
+        let cdn = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/asset/"))
+            .and(header("cookie", ".ROBLOSECURITY=c"))
+            .respond_with(redirect_to(format!("{}/blob", cdn.uri())))
+            .mount(&delivery)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/blob"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bytes".to_vec()))
+            .mount(&cdn)
+            .await;
+        let ctx = Ctx {
+            cookie_header: Some(".ROBLOSECURITY=c".to_string()),
+            ..ctx(&delivery, Source::Public, None)
+        };
+
+        assert_eq!(download_bytes(&ctx, 42, None).await.unwrap(), b"bytes");
+        let [request] = &requests_for(&cdn, "/blob").await[..] else {
+            panic!("the CDN was asked once");
+        };
+        assert!(request.headers.get("cookie").is_none());
+    }
+
+    /// A redirect that stays on the host keeps the credential, so a moved
+    /// path still reaches what the account can see. The location is relative,
+    /// as a server is free to send it.
+    #[tokio::test]
+    async fn a_redirect_on_the_same_host_keeps_the_credential() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/asset/"))
+            .respond_with(redirect_to("/v2/asset/?id=42".to_string()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/asset/"))
+            .and(header("cookie", ".ROBLOSECURITY=c"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bytes".to_vec()))
+            .mount(&server)
+            .await;
+        let ctx = Ctx {
+            cookie_header: Some(".ROBLOSECURITY=c".to_string()),
+            ..ctx(&server, Source::Public, None)
+        };
+
+        assert_eq!(download_bytes(&ctx, 42, None).await.unwrap(), b"bytes");
+    }
+
+    /// Once the credential has been left behind, a hop back to its host does
+    /// not pick it up again: the way back was chosen by the other host.
+    #[tokio::test]
+    async fn a_credential_left_behind_is_not_picked_up_again() {
+        let delivery = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/asset/"))
+            .respond_with(redirect_to(format!("{}/bounce", elsewhere.uri())))
+            .mount(&delivery)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/bounce"))
+            .respond_with(redirect_to(format!("{}/back", delivery.uri())))
+            .mount(&elsewhere)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/back"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bytes".to_vec()))
+            .mount(&delivery)
+            .await;
+        let ctx = Ctx {
+            cookie_header: Some(".ROBLOSECURITY=c".to_string()),
+            ..ctx(&delivery, Source::Public, None)
+        };
+
+        assert_eq!(download_bytes(&ctx, 42, None).await.unwrap(), b"bytes");
+        let [back] = &requests_for(&delivery, "/back").await[..] else {
+            panic!("/back was asked once");
+        };
+        assert!(back.headers.get("cookie").is_none());
     }
 
     /// clap checks a command's definition only when it is built, and a clash

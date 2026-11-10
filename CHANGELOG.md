@@ -10,6 +10,7 @@
 
 ### Security
 
+- The API key no longer follows a redirect to another host. Redirects were followed with every header but `Cookie` and `Authorization`, so a redirect from the Open Cloud host sent `x-api-key` on to wherever it pointed. Redirects are now followed one hop at a time, and the key and the cookie go along only while every hop stays on the host they were given for.
 - Release archives carry a build provenance attestation: `gh attestation verify <zip> --repo rbx-forge/rbx-download`. The build jobs run with read access only, and the publishing job alone may write.
 
 ## [0.1.0] - 2026-11-08
