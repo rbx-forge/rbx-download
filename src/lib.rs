@@ -739,10 +739,28 @@ struct PartFile {
 
 impl PartFile {
     fn write(dir: &std::path::Path, filename: &str, bytes: &[u8]) -> std::io::Result<Self> {
-        let part = Self {
-            path: dir.join(format!(".{filename}.{}.part", std::process::id())),
-        };
-        std::fs::write(&part.path, bytes)?;
+        use std::io::Write as _;
+
+        let path = dir.join(format!(".{filename}.{}.part", std::process::id()));
+        // Something at this name is a part an earlier run under the same
+        // process id left behind, or a link someone put there. Removing it
+        // removes the link and never what it points to, and `create_new` then
+        // makes a file of this run's own: nothing is ever written through a
+        // hard link or a symlink found at the name.
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        // Ours from here, so dropping it on an error below removes it.
+        let part = Self { path };
+        file.write_all(bytes)?;
+        // On disk before it takes the name: a crash just after the move must
+        // not leave the name on bytes that were still in a cache.
+        file.sync_all()?;
         Ok(part)
     }
 
@@ -1133,6 +1151,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(names_in(dir.path()), ["42.rbxm", "43.rbxm"]);
+    }
+
+    /// A link found at the part's name is replaced, not written through: the
+    /// file it points to keeps its bytes.
+    #[test]
+    fn a_part_is_never_written_through_a_link_at_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"keep").unwrap();
+        let name = format!(".42.rbxm.{}.part", std::process::id());
+        std::fs::hard_link(&victim, dir.path().join(&name)).unwrap();
+
+        let part = PartFile::write(dir.path(), "42.rbxm", b"new").unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&part.path).unwrap(), b"new");
     }
 
     /// The name taken between the check and the move is not overwritten, and
