@@ -18,11 +18,12 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use colored::Colorize;
+use reqwest::StatusCode;
 
-use rbx_core::api::ApiBase;
+use rbx_core::api::{execute_with_retry_policy, ApiBase, ApiError, RetryPolicy};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -176,6 +177,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         raw: cli.raw,
         force: cli.force,
         forced,
+        retry: RetryPolicy::default(),
     };
 
     download_all(&ctx, &ids).await
@@ -284,7 +286,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// connect timeout and a read timeout catch a dead server and a stalled one,
 /// and leave a slow download alone for as long as it keeps moving.
 ///
-/// It follows no redirect itself: [`get`] does, and decides at each hop
+/// It follows no redirect itself: [`follow`] does, and decides at each hop
 /// whether the credential goes along.
 fn http_client(connect: Duration, read: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
@@ -299,6 +301,29 @@ fn http_client(connect: Duration, read: Duration) -> Result<reqwest::Client> {
 /// As many redirects as one request may follow: reqwest's own default.
 const MAX_REDIRECTS: usize = 10;
 
+/// GET `url` through [`follow`], retrying what is worth retrying.
+///
+/// Every request here is a GET that changes nothing, so sending it again is
+/// always safe: a 429, a 5xx, a timeout or a failed connection is retried with
+/// backoff, as the retry layer does. Only the request is retried, up to its
+/// response headers; a body that breaks off halfway fails that asset.
+///
+/// A failure that came with an answer reaches `refused` with its status and
+/// body, which turns it into the sentence for that endpoint.
+async fn get(
+    ctx: &Ctx,
+    url: &str,
+    credential: Option<(&str, &str)>,
+    refused: impl FnOnce(StatusCode, &str) -> anyhow::Error,
+) -> Result<reqwest::Response> {
+    execute_with_retry_policy(|| follow(ctx, url, credential), &ctx.retry)
+        .await
+        .map_err(|error| match error.downcast_ref::<ApiError>() {
+            Some(answer) => refused(answer.status(), answer.body()),
+            None => error,
+        })
+}
+
 /// GET `url`, with a credential header if one is given, following redirects.
 ///
 /// The delivery endpoints redirect to a CDN. reqwest drops `Authorization`
@@ -307,7 +332,11 @@ const MAX_REDIRECTS: usize = 10;
 /// it instead. The credential goes with a hop only while every hop so far has
 /// stayed on the origin it was given for (scheme, host and port), and once
 /// dropped it stays dropped.
-async fn get(ctx: &Ctx, url: &str, credential: Option<(&str, &str)>) -> Result<reqwest::Response> {
+async fn follow(
+    ctx: &Ctx,
+    url: &str,
+    credential: Option<(&str, &str)>,
+) -> Result<reqwest::Response> {
     let mut url = reqwest::Url::parse(url).with_context(|| format!("invalid URL {url}"))?;
     let origin = url.origin();
     let mut credential = credential;
@@ -354,6 +383,8 @@ struct Ctx {
     force: bool,
     /// `(extension, type_id)` from --type, when given.
     forced: Option<(String, Option<i64>)>,
+    /// How [`get`] retries. The default outside tests, which do not wait.
+    retry: RetryPolicy,
 }
 
 async fn download_one(ctx: &Ctx, id: u64) -> Result<Saved> {
@@ -394,15 +425,10 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
                 Some(v) => cloud.join(&format!("/asset-delivery-api/v1/assetId/{id}/version/{v}")),
                 None => cloud.join(&format!("/asset-delivery-api/v1/assetId/{id}")),
             };
-            let resp = get(ctx, &url, Some(("x-api-key", key))).await?;
-            if !resp.status().is_success() {
-                let s = resp.status();
-                bail!(
-                    "asset-delivery {}: {}",
-                    s,
-                    resp.text().await.unwrap_or_default()
-                );
-            }
+            let resp = get(ctx, &url, Some(("x-api-key", key)), |status, body| {
+                anyhow!("asset-delivery {status}: {body}")
+            })
+            .await?;
             let meta: serde_json::Value = resp.json().await?;
             let location = meta
                 .get("location")
@@ -410,17 +436,23 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
                 .context("no download location in asset-delivery response")?;
             // No key: the location carries its own authorisation, and is a
             // host this code did not choose.
-            let dl = get(ctx, location, None).await?;
-            if !dl.status().is_success() {
-                bail!("CDN returned {}", dl.status());
-            }
+            let dl = get(ctx, location, None, |status, _| {
+                anyhow!("CDN returned {status}")
+            })
+            .await?;
             Ok(dl.bytes().await?.to_vec())
         }
         Source::Public => {
             let delivery = &ctx.hosts.delivery;
             let url = delivery.join(&format!("/v1/asset/?id={id}"));
-            let resp = get(ctx, &url, cookie(ctx)).await?;
-            let status = resp.status();
+            let resp = get(ctx, &url, cookie(ctx), |status, body| {
+                anyhow!(
+                    "{}",
+                    public_refusal(body.as_bytes())
+                        .unwrap_or_else(|| format!("assetdelivery returned {status}"))
+                )
+            })
+            .await?;
             let is_json = resp
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
@@ -430,25 +462,30 @@ async fn download_bytes(ctx: &Ctx, id: u64, version: Option<u64>) -> Result<Vec<
             let bytes = resp.bytes().await?;
             if is_json {
                 // Body is an error payload, not the asset.
-                let msg = serde_json::from_slice::<serde_json::Value>(&bytes)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("errors")
-                            .and_then(|e| e.get(0))
-                            .and_then(|e| e.get("message"))
-                            .and_then(|m| m.as_str())
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_else(|| "asset not available (may be private or moderated)".into());
-                bail!("{}", msg);
-            }
-            if !status.is_success() {
-                bail!("assetdelivery returned {}", status);
+                bail!(
+                    "{}",
+                    public_refusal(&bytes).unwrap_or_else(|| NOT_AVAILABLE.to_string())
+                );
             }
             Ok(bytes.to_vec())
         }
     }
 }
+
+/// What the public endpoint's JSON error body says, when the body is JSON.
+fn public_refusal(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let message = value
+        .get("errors")
+        .and_then(|e| e.get(0))
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .map_or(NOT_AVAILABLE, |m| m);
+    Some(message.to_string())
+}
+
+/// The public endpoint's refusal when its JSON body names no reason.
+const NOT_AVAILABLE: &str = "asset not available (may be private or moderated)";
 
 /// The `Cookie` header for [`get`], when the run has a session.
 fn cookie(ctx: &Ctx) -> Option<(&str, &str)> {
@@ -459,13 +496,10 @@ fn cookie(ctx: &Ctx) -> Option<(&str, &str)> {
 async fn fetch_details(ctx: &Ctx, id: u64) -> Result<(Option<String>, Option<i64>)> {
     let economy = &ctx.hosts.economy;
     let url = economy.join(&format!("/v2/assets/{id}/details"));
-    let resp = get(ctx, &url, cookie(ctx)).await?;
-    if !resp.status().is_success() {
-        bail!(
-            "economy details {} (tip: pass --type to skip this lookup)",
-            resp.status()
-        );
-    }
+    let resp = get(ctx, &url, cookie(ctx), |status, _| {
+        anyhow!("economy details {status} (tip: pass --type to skip this lookup)")
+    })
+    .await?;
     let v: serde_json::Value = resp.json().await?;
     let name = v.get("Name").and_then(|n| n.as_str()).map(str::to_string);
     let type_id = v.get("AssetTypeId").and_then(|t| t.as_i64());
@@ -662,8 +696,15 @@ mod tests {
             raw: false,
             force: false,
             forced: None,
+            retry: NO_WAIT,
         }
     }
+
+    /// The default number of retries, without the backoff between them.
+    const NO_WAIT: RetryPolicy = RetryPolicy {
+        max_retries: 3,
+        base_backoff_secs: 0,
+    };
 
     /// An output directory of its own, and a `--type` so no economy lookup
     /// is needed: what a test of the files on disk wants.
@@ -790,6 +831,7 @@ mod tests {
             raw: false,
             force: false,
             forced: None,
+            retry: NO_WAIT,
         }
     }
 
@@ -955,6 +997,134 @@ mod tests {
             panic!("/back was asked once");
         };
         assert!(back.headers.get("cookie").is_none());
+    }
+
+    /// Answers `status` to the first request for `path` only, ahead of
+    /// whatever else is mounted for it.
+    async fn fail_once(server: &MockServer, path_: &str, status: u16) {
+        Mock::given(method("GET"))
+            .and(path(path_))
+            .respond_with(ResponseTemplate::new(status))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    /// A download is a GET that changes nothing, so a 5xx is worth another
+    /// try rather than a failed asset.
+    #[tokio::test]
+    async fn a_server_error_on_the_public_endpoint_is_retried() {
+        let server = MockServer::start().await;
+        fail_once(&server, "/v1/asset/", 503).await;
+        serve_public(&server, 42, b"bytes").await;
+
+        let bytes = download_bytes(&ctx(&server, Source::Public, None), 42, None)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"bytes");
+        assert_eq!(requests_for(&server, "/v1/asset/").await.len(), 2);
+    }
+
+    /// Both halves of the cloud path: a rate limit on the lookup and a server
+    /// error from the CDN.
+    #[tokio::test]
+    async fn the_cloud_lookup_and_the_cdn_are_both_retried() {
+        let server = MockServer::start().await;
+        fail_once(&server, "/asset-delivery-api/v1/assetId/42", 429).await;
+        fail_once(&server, "/cdn/blob", 500).await;
+        Mock::given(method("GET"))
+            .and(path("/asset-delivery-api/v1/assetId/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "location": format!("{}/cdn/blob", server.uri())
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/cdn/blob"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bytes".to_vec()))
+            .mount(&server)
+            .await;
+
+        let bytes = download_bytes(&ctx(&server, Source::Cloud, Some("k")), 42, None)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"bytes");
+    }
+
+    #[tokio::test]
+    async fn a_server_error_on_the_details_is_retried() {
+        let server = MockServer::start().await;
+        fail_once(&server, "/v2/assets/42/details", 502).await;
+        Mock::given(method("GET"))
+            .and(path("/v2/assets/42/details"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"AssetTypeId": 8})),
+            )
+            .mount(&server)
+            .await;
+
+        let (_, type_id) = fetch_details(&ctx(&server, Source::Public, None), 42)
+            .await
+            .unwrap();
+        assert_eq!(type_id, Some(8));
+    }
+
+    /// A 404 is an answer, and asking again gets the same one.
+    #[tokio::test]
+    async fn a_missing_asset_is_asked_for_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/asset/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let error = download_bytes(&ctx(&server, Source::Public, None), 42, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("404"), "got: {error}");
+        assert_eq!(requests_for(&server, "/v1/asset/").await.len(), 1);
+    }
+
+    /// A server whose first connection hears the request and never answers,
+    /// and whose later ones answer `body` straight away.
+    fn server_that_stalls_once(body: &'static [u8]) -> String {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (n, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { return };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    if n == 0 {
+                        std::thread::sleep(Duration::from_secs(3));
+                        return;
+                    }
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(body);
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// A request that times out waiting for its answer is sent again.
+    #[tokio::test]
+    async fn a_request_that_times_out_is_retried() {
+        let base = server_that_stalls_once(b"bytes");
+        let ctx = ctx_against(&base, Duration::from_millis(300));
+
+        let started = std::time::Instant::now();
+        assert_eq!(download_bytes(&ctx, 42, None).await.unwrap(), b"bytes");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     /// clap checks a command's definition only when it is built, and a clash
