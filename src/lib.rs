@@ -164,6 +164,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     std::fs::create_dir_all(&cli.output)
         .with_context(|| format!("creating output dir {}", cli.output.display()))?;
+    sweep_stale_parts(&cli.output, STALE_PART_AGE);
 
     let ctx = Ctx {
         client,
@@ -525,53 +526,134 @@ async fn fetch_details(ctx: &Ctx, id: u64) -> Result<(Option<String>, Option<i64
 ///
 /// The filename does not carry the asset version, so a file already there may
 /// be another version of the same asset, or a file the user edited. The same
-/// bytes are left alone; different ones are refused unless `--force`.
+/// bytes are left alone, with or without `--force`; different ones are refused
+/// unless `--force`.
+///
+/// The bytes are written to a [`PartFile`] beside the target and moved into
+/// place whole, so the target is never a truncated file: not after a write
+/// that failed, not after a Ctrl-C, and not under `--force`, where the user's
+/// file stays as it was until the new one is complete.
 fn save(ctx: &Ctx, id: u64, name: &Option<String>, ext: &str, bytes: &[u8]) -> Result<Saved> {
     let filename = match name.as_deref().map(rbx_core::fs_name::safe_component) {
         Some(safe) if !safe.is_empty() => format!("{id}_{safe}.{ext}"),
         _ => format!("{id}.{ext}"),
     };
     let path = ctx.output.join(&filename);
+    let reading = || format!("reading {}", path.display());
     let writing = || format!("writing {}", path.display());
 
-    if ctx.force {
-        // The same bytes are left alone under `--force` too: nothing to
-        // overwrite, and the file keeps its modification time.
-        if same_contents(&path, bytes).unwrap_or(false) {
-            return Ok(Saved::AlreadyThere(filename));
-        }
-        std::fs::write(&path, bytes).with_context(writing)?;
-        return Ok(Saved::Written(filename));
+    // What is there decides first, so a refused asset costs no write.
+    match same_contents(&path, bytes) {
+        Ok(true) => return Ok(Saved::AlreadyThere(filename)),
+        Ok(false) if !ctx.force => return Ok(Saved::Refused(path)),
+        Ok(false) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(reading),
     }
 
-    // `create_new` rather than a check followed by a write, so a file that
-    // appears in between is not overwritten either.
-    let created = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path);
-    match created {
-        Ok(mut file) => {
-            use std::io::Write as _;
-            if let Err(e) = file.write_all(bytes) {
-                // A half-written file would be refused as "different" by the
-                // next run, so it goes rather than stays.
-                drop(file);
-                let _ = std::fs::remove_file(&path);
-                return Err(e).with_context(writing);
-            }
-            Ok(Saved::Written(filename))
-        }
+    let part = PartFile::write(&ctx.output, &filename, bytes).with_context(writing)?;
+    if ctx.force {
+        part.replace(&path).with_context(writing)?;
+        return Ok(Saved::Written(filename));
+    }
+    match part.place_new(&path) {
+        Ok(()) => Ok(Saved::Written(filename)),
+        // Something took the name since the check above.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let same = same_contents(&path, bytes)
-                .with_context(|| format!("reading {}", path.display()))?;
-            if same {
+            if same_contents(&path, bytes).with_context(reading)? {
                 Ok(Saved::AlreadyThere(filename))
             } else {
                 Ok(Saved::Refused(path))
             }
         }
         Err(e) => Err(e).with_context(writing),
+    }
+}
+
+/// A download written beside its final name as `.<name>.<pid>.part`, then
+/// moved onto it whole.
+///
+/// The process id keeps two runs in one directory out of each other's way.
+/// Dropping one removes it, which covers every error on the way; a run that is
+/// killed leaves it behind, and [`sweep_stale_parts`] clears it on a later run.
+#[derive(Debug)]
+struct PartFile {
+    path: PathBuf,
+}
+
+impl PartFile {
+    fn write(dir: &std::path::Path, filename: &str, bytes: &[u8]) -> std::io::Result<Self> {
+        let part = Self {
+            path: dir.join(format!(".{filename}.{}.part", std::process::id())),
+        };
+        std::fs::write(&part.path, bytes)?;
+        Ok(part)
+    }
+
+    /// Onto `target`, over whatever is there. A rename replaces its target in
+    /// one step, so `target` is the old file or the new one, never half of
+    /// either.
+    fn replace(self, target: &std::path::Path) -> std::io::Result<()> {
+        std::fs::rename(&self.path, target)
+    }
+
+    /// Onto `target`, only if nothing is there: `AlreadyExists` otherwise.
+    ///
+    /// A hard link refuses an existing target in one step, the promise
+    /// `create_new` makes, and the part is then dropped. A file system without
+    /// hard links (FAT, some network shares) gets a check and a rename instead,
+    /// which leaves a moment between the two.
+    fn place_new(self, target: &std::path::Path) -> std::io::Result<()> {
+        match std::fs::hard_link(&self.path, target) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+            Err(_) if target.try_exists()? => Err(std::io::ErrorKind::AlreadyExists.into()),
+            Err(_) => std::fs::rename(&self.path, target),
+        }
+    }
+}
+
+impl Drop for PartFile {
+    fn drop(&mut self) {
+        // Gone already after a rename, which is the usual case.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// How old a part file must be before a run treats it as left behind.
+///
+/// A run writes each part in one go and moves it at once, so one still there a
+/// minute later belongs to a run that was killed.
+const STALE_PART_AGE: Duration = Duration::from_secs(60);
+
+/// Remove the part files a killed run left in `dir`, older than `age`.
+///
+/// Only names of the shape [`PartFile`] makes, `.<name>.<digits>.part`, so a
+/// file of the user's that happens to end in `.part` is left alone.
+fn sweep_stale_parts(dir: &std::path::Path, age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let is_part = name
+            .strip_prefix('.')
+            .and_then(|rest| rest.strip_suffix(".part"))
+            .and_then(|rest| rest.rsplit_once('.'))
+            .is_some_and(|(stem, pid)| {
+                !stem.is_empty() && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
+            });
+        let is_stale = entry
+            .metadata()
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|elapsed| elapsed > age);
+        if is_part && is_stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -843,6 +925,106 @@ mod tests {
 
         let saved = download_one(&ctx, 42).await.unwrap();
         assert_eq!(saved, Saved::AlreadyThere("42.rbxm".to_string()));
+    }
+
+    fn names_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Under `--force`, a write that fails leaves the user's file as it was.
+    /// The part file's name is taken by a directory here, so the write fails
+    /// before anything reaches the target; writing the target in place would
+    /// have truncated it first.
+    #[tokio::test]
+    async fn a_failed_write_under_force_leaves_the_existing_file_whole() {
+        let server = MockServer::start().await;
+        serve_public(&server, 42, b"v2").await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("42.rbxm"), b"v1").unwrap();
+        let part = dir
+            .path()
+            .join(format!(".42.rbxm.{}.part", std::process::id()));
+        std::fs::create_dir(&part).unwrap();
+        let ctx = Ctx {
+            force: true,
+            ..ctx_writing_to(&server, &dir)
+        };
+
+        assert!(download_one(&ctx, 42).await.is_err());
+        assert_eq!(std::fs::read(dir.path().join("42.rbxm")).unwrap(), b"v1");
+    }
+
+    /// A finished download leaves its file and nothing beside it, with or
+    /// without `--force`.
+    #[tokio::test]
+    async fn a_download_leaves_no_part_file_behind() {
+        let server = MockServer::start().await;
+        serve_public(&server, 42, b"v2").await;
+        serve_public(&server, 43, b"new").await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("42.rbxm"), b"v1").unwrap();
+        let ctx = Ctx {
+            force: true,
+            ..ctx_writing_to(&server, &dir)
+        };
+        download_all(&ctx, &[42]).await.unwrap();
+        download_all(&ctx_writing_to(&server, &dir), &[43])
+            .await
+            .unwrap();
+
+        assert_eq!(names_in(dir.path()), ["42.rbxm", "43.rbxm"]);
+    }
+
+    /// The name taken between the check and the move is not overwritten, and
+    /// the part goes.
+    #[test]
+    fn a_part_is_not_placed_over_a_file_that_appeared() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = PartFile::write(dir.path(), "42.rbxm", b"new").unwrap();
+        let target = dir.path().join("42.rbxm");
+        std::fs::write(&target, b"theirs").unwrap();
+
+        let error = part.place_new(&target).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"theirs");
+        assert_eq!(names_in(dir.path()), ["42.rbxm"]);
+    }
+
+    /// A killed run's part file goes once it is old enough. A fresh one may be
+    /// another run's, and a name of another shape is the user's.
+    #[test]
+    fn stale_part_files_are_swept_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name: &str, age: Duration| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"x").unwrap();
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(std::time::SystemTime::now() - age)
+                .unwrap();
+        };
+        let old = Duration::from_secs(120);
+        make(".42.rbxm.1234.part", old);
+        make(".43.rbxm.1234.part", Duration::ZERO);
+        make(".notes.part", old);
+        make("draft.1234.part", old);
+        make(".44.rbxm.12a4.part", old);
+
+        sweep_stale_parts(dir.path(), STALE_PART_AGE);
+
+        assert_eq!(
+            names_in(dir.path()),
+            [
+                ".43.rbxm.1234.part",
+                ".44.rbxm.12a4.part",
+                ".notes.part",
+                "draft.1234.part"
+            ]
+        );
     }
 
     /// A server that answers one request with `body`, sent in `pieces` parts

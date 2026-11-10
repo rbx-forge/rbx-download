@@ -92,6 +92,8 @@ The filename does not carry the asset version, so two versions of one asset shar
 - with the same bytes, it is left alone and reported as `already there`, with or without `--force`;
 - with different bytes, that asset is refused with the file's path, the other ids still download, and the run exits non-zero. `--force` overwrites it instead.
 
+A file is written beside its name as `.<name>.<pid>.part` and moved into place once complete, so a download that fails or is interrupted never leaves a truncated file under the asset's name, and `--force` never destroys the file it was replacing. A run removes the part files older than a minute that a killed run left in the output directory.
+
 ## Network
 
 A connection gets 30 seconds to open, and the server 60 seconds of silence before the request is given up. There is no cap on the transfer as a whole, so a large asset on a slow link takes as long as it takes while its bytes keep arriving.
