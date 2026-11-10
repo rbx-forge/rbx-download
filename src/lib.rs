@@ -36,8 +36,9 @@ pub struct Cli {
     /// Asset ids to download.
     pub ids: Vec<u64>,
 
-    /// Read additional asset ids from a file (whitespace/comma/newline
-    /// separated; lines starting with `#` are ignored).
+    /// Read additional asset ids from a file: separated by whitespace, commas
+    /// or newlines, with `#` starting a comment that runs to the end of the
+    /// line.
     #[arg(short = 'f', long)]
     pub file: Option<PathBuf>,
 
@@ -358,16 +359,28 @@ fn save(ctx: &Ctx, id: u64, name: &Option<String>, ext: &str, bytes: &[u8]) -> R
 fn read_ids_file(path: &PathBuf) -> Result<Vec<u64>> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    parse_ids(&text).with_context(|| format!("reading ids from {}", path.display()))
+}
+
+/// The ids in an ids file: separated by whitespace, commas or newlines, with
+/// `#` opening a comment that runs to the end of its line.
+///
+/// The comment is cut off per line before anything is split. Splitting first
+/// and skipping the words that start with `#` drops the `#` and keeps the rest
+/// of the sentence, so `# hats for the lobby` failed on `hats`.
+fn parse_ids(text: &str) -> Result<Vec<u64>> {
     let mut ids = Vec::new();
-    for token in text.split(|c: char| c.is_whitespace() || c == ',') {
-        let t = token.trim();
-        if t.is_empty() || t.starts_with('#') {
-            continue;
+    for (number, line) in text.lines().enumerate() {
+        let code = line.split_once('#').map_or(line, |(code, _comment)| code);
+        for token in code.split(|c: char| c.is_whitespace() || c == ',') {
+            if token.is_empty() {
+                continue;
+            }
+            let id: u64 = token
+                .parse()
+                .with_context(|| format!("invalid asset id on line {}: '{token}'", number + 1))?;
+            ids.push(id);
         }
-        let id: u64 = t
-            .parse()
-            .with_context(|| format!("invalid asset id in file: '{t}'"))?;
-        ids.push(id);
     }
     Ok(ids)
 }
@@ -512,6 +525,27 @@ mod tests {
             Cli::try_parse_from(["rbx-download", "42", "--auto-cookie", "--no-auto-cookie"])
                 .is_err()
         );
+    }
+
+    /// The format the help and the README describe: comments on a line of
+    /// their own and after an id, blank lines, and every separator mixed.
+    #[test]
+    fn an_ids_file_takes_comments_blank_lines_and_any_separator() {
+        let text = "# hats for the lobby\n\
+                    1, 2 3\n\
+                    \n\
+                    \t4,5 # the one with the feather, 6\n\
+                    7\r\n\
+                    #8\n";
+        assert_eq!(parse_ids(text).unwrap(), [1, 2, 3, 4, 5, 7]);
+    }
+
+    /// A word outside a comment is still a mistake, and the error says where.
+    #[test]
+    fn a_word_outside_a_comment_is_refused_with_its_line() {
+        let error = parse_ids("1\n2 hats\n").unwrap_err();
+        assert!(error.to_string().contains("line 2"), "got: {error}");
+        assert!(error.to_string().contains("'hats'"), "got: {error}");
     }
 
     /// A carousel preview video is an HLS manifest, not a video file, and the
