@@ -311,6 +311,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "colored"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "compression-codecs"
 version = "0.4.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1356,7 +1365,7 @@ dependencies = [
  "bit-vec",
  "blake3",
  "clap",
- "colored",
+ "colored 2.2.0",
  "dialoguer",
  "image",
  "rbx_cookie",
@@ -1373,7 +1382,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
- "colored",
+ "colored 3.1.1",
  "rbx-core",
  "reqwest",
  "serde_json",
