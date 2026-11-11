@@ -1,0 +1,72 @@
+# cargo-deny: what we accept from the dependency tree.
+#
+# This tool ships as a statically linked binary, so four questions matter
+# beyond "does it build": is a dependency subject to a published advisory,
+# does a license put terms on the binary we cannot meet, does a crate come
+# from somewhere other than crates.io or the one git source we chose, and are
+# duplicate major versions creeping in.
+#
+# Run it locally with the same command CI runs: `cargo deny check`.
+
+[graph]
+# The targets the release ships, so cargo-deny does not ask crates that no
+# build ever compiles (UEFI, WASI, ...) to justify themselves.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+version = 2
+# No blanket ignores. An advisory that does not apply is listed by id with its
+# reason and a date to look at it again, and leaves the list as soon as the
+# dependency can move.
+ignore = []
+
+[licenses]
+version = 2
+# Enumerated rather than pattern matched: a new license in the tree should fail
+# CI and be a decision. Each one here allows redistribution in a binary under
+# MPL-2.0. Deliberately absent: GPL and LGPL in any form, whose terms would
+# attach to a statically linked artifact.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# The threshold cargo-deny itself suggests for a license file matched by text
+# rather than by SPDX id.
+confidence-threshold = 0.8
+
+[bans]
+# Warn, not deny: a duplicate version is usually a dependency's transitive lag,
+# and failing CI on something only a fork could fix trains everyone to ignore
+# the job.
+multiple-versions = "warn"
+# No `*` version requirement on a crates.io dependency. A git dependency has no
+# version requirement at all, which cargo-deny counts as a wildcard; the one
+# here is rbx-core, pinned by tag, and `allow-wildcard-paths` lets it through
+# because this crate is `publish = false`.
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# crates.io, plus one git dependency: rbx-core, the library the rbx-forge
+# tools share, pinned by tag. Any other git source is refused.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/rbx-forge/rbx-core"]

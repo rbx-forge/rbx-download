@@ -1,0 +1,61 @@
+name: Supply chain
+
+# Two triggers, because the two failure modes arrive differently.
+#
+# A dependency change arrives in a pull request, and that is what the `push` /
+# `pull_request` legs catch, gated on the files that can change the resolved
+# graph. An advisory arrives on its own schedule: RUSTSEC publishes against a
+# version already in `Cargo.lock`, nothing here moves, and a check that only
+# ran on push would stay green for as long as nobody touched a manifest. Hence
+# the weekly run.
+#
+# `workflow_dispatch` so "is this still clean?" does not need a commit.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/supply-chain.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/supply-chain.yml"
+  schedule:
+    # Mondays, 06:00 UTC: a finding has working days left in it.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deny:
+    name: cargo-deny (${{ matrix.check }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # One job per check, so a license question and a security advisory are
+      # two separate red marks rather than one hiding the other.
+      fail-fast: false
+      matrix:
+        check: [advisories, bans, licenses, sources]
+    # `checks: write` lets the action attach findings to a PR's diff.
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          # No severity flags on purpose: what fails and what warns is decided
+          # in `deny.toml`, which is also what a local `cargo deny check` reads.
+          command: check ${{ matrix.check }}
