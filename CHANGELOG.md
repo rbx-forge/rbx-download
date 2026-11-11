@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Security
+
+- **A redirect that names no location to follow is reported by its status, without its body.** The body was shown when the asset-delivery lookup answered with it, and the body of a redirect often repeats its target, which can be a signed download link.
+
 ## [0.2.0] - 2026-11-10
 
 ### Fixed

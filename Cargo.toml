@@ -36,10 +36,10 @@ colored = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-# The HTTP client, the host constants, the filename sanitiser and the Studio
-# cookie lookup with its consent prompt. A branch rather than a rev: Cargo.lock
-# pins the exact commit, and `cargo update -p rbx-core` is how a fix arrives.
-rbx-core = { git = "https://github.com/rbx-forge/rbx-core", tag = "v0.1.4" }
+# The retry layer, the host type, the filename sanitiser and the Studio cookie
+# lookup with its consent prompt. A release tag: Cargo.lock pins the commit it
+# names, and a fix arrives by moving the tag here, then `cargo update -p rbx-core`.
+rbx-core = { git = "https://github.com/rbx-forge/rbx-core", tag = "v0.2.0" }
 
 [dev-dependencies]
 tempfile = "3"
