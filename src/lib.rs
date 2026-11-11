@@ -1725,6 +1725,32 @@ mod tests {
         assert!(!shown.contains(SIGNATURE), "got: {shown}");
     }
 
+    /// A redirect with no `location` to follow is a refusal, and its body is
+    /// not shown even from the lookup, whose bodies otherwise are: the body
+    /// of a redirect often repeats its target, signature and all.
+    #[tokio::test]
+    async fn a_redirect_with_no_location_does_not_print_its_body() {
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/asset-delivery-api/v1/assetId/42"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .set_body_string(format!("Found. Redirecting to /cdn/blob?{SIGNATURE}")),
+            )
+            .mount(&api)
+            .await;
+
+        let error = download_bytes(&ctx(&api, Source::Cloud, Some("k")), 42, None)
+            .await
+            .unwrap_err();
+        let shown = format!("{error:#}");
+        assert!(!shown.contains(SIGNATURE), "got: {shown}");
+        assert!(
+            shown.starts_with("the asset-delivery lookup failed: 302 Found"),
+            "got: {shown}"
+        );
+    }
+
     /// The same for a body that breaks off after a redirect, where the
     /// response's own URL is the signed one. reqwest 0.12 leaves the URL off
     /// a body error by itself; this holds that whatever reqwest does.
