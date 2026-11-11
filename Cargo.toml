@@ -29,7 +29,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-colored = "2"
+colored = "3"
 # Same major as `rbx-core`, so a `reqwest` type passed between the two crates is
 # one type and not two of the same name. TLS is whatever `rbx-core` selects, which
 # is rustls over the OS trust store: no OpenSSL to find at launch.
