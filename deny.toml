@@ -20,9 +20,10 @@ all-features = true
 
 [advisories]
 version = 2
-# No blanket ignores. An advisory that does not apply is listed by id with its
-# reason and a date to look at it again, and leaves the list as soon as the
-# dependency can move.
+# No blanket ignores. An advisory that does not apply is listed in cargo-deny's
+# structured form, its reason ending with the date to look at it again, and
+# leaves the list as soon as the dependency can move:
+#   { id = "RUSTSEC-0000-0000", reason = "why it does not apply; revisit by YYYY-MM-DD" },
 ignore = []
 
 [licenses]
