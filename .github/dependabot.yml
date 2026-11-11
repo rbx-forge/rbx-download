@@ -1,0 +1,50 @@
+version: 2
+updates:
+  # Version updates only. Security-update PRs (one opened when an advisory hits
+  # Cargo.lock) are a repository setting, not something this file turns on.
+  # Whether that setting is on or off, the weekly Supply chain run fails when an
+  # advisory reaches Cargo.lock.
+  #
+  # Minor and patch updates arrive as one grouped PR a week; a major update gets
+  # its own PR, since it is the one that can break the build. The PR limit keeps
+  # a backlog from piling up while nobody is looking.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Paris
+    open-pull-requests-limit: 3
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # rbx-core is a git dependency pinned by tag, and Dependabot does move a
+      # tag that reads as a version (v0.1.4 to v0.1.5). Moving it is a
+      # deliberate change here, made with its changelog entry and its tests,
+      # so Dependabot leaves it alone.
+      - dependency-name: rbx-core
+    commit-message:
+      prefix: chore
+      include: scope
+
+  # Actions run in CI with repository credentials, so their bumps are worth a
+  # look of their own. Pinned by SHA; Dependabot keeps the `# vX` comment
+  # beside each pin in step.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Paris
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore
+      include: scope
