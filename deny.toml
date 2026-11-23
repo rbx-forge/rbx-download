@@ -24,7 +24,9 @@ version = 2
 # structured form, its reason ending with the date to look at it again, and
 # leaves the list as soon as the dependency can move:
 #   { id = "RUSTSEC-0000-0000", reason = "why it does not apply; revisit by YYYY-MM-DD" },
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0594", reason = "cookie comes in through rbx_cookie, which only parses a Cookie; the advisory is in PrivateJar, which nothing here calls, and rbx_cookie has no release on a patched cookie; revisit by 2027-02-23" },
+]
 
 [licenses]
 version = 2
